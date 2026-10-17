@@ -1,5 +1,8 @@
 node_modules/
 .env
+# 个人面试材料：简历/项目深挖手册/口径管理，属敏感隐私，永不入库
+profile.md
+profile/
 .venv-whisper/
 .whisper-models/
 eng.traineddata
@@ -7,3 +10,5 @@ dist/
 bin/
 .DS_Store
 *.log
+.verify/
+scripts/__pycache__/

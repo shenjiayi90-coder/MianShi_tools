@@ -1,7 +1,9 @@
-const { GoogleGenAI } = require('@google/genai');
+const { DeepSeekClient, DeepSeekApiError } = require('./deepseek.client');
+const { toDeepSeekParams } = require('./deepseek.adapter');
 const logger = require('../core/logger').createServiceLogger('LLM');
 const config = require('../core/config');
 const { promptLoader } = require('../../prompt-loader');
+const profileLoader = require('./profile-loader');
 
 class LLMService {
   constructor() {
@@ -10,46 +12,66 @@ class LLMService {
     this.isInitialized = false;
     this.requestCount = 0;
     this.errorCount = 0;
-    
+
     this.initializeClient();
   }
 
+  /** Active provider id. Only 'deepseek' is implemented today. */
+  get provider() {
+    return config.get('llm.provider') || 'deepseek';
+  }
+
+  /** Config subtree for the active provider (model, timeout, generation, …). */
+  get providerConfig() {
+    return config.get(`llm.${this.provider}`) || {};
+  }
+
   initializeClient() {
-    const apiKey = config.getApiKey('GEMINI');
-    
-    if (!apiKey || apiKey === 'your-api-key-here') {
-      logger.warn('Gemini API key not configured', { 
+    const apiKey = config.getApiKey('DEEPSEEK');
+
+    if (!apiKey || apiKey === 'your_deepseek_api_key_here') {
+      logger.warn('DeepSeek API key not configured', {
         keyExists: !!apiKey,
-        isPlaceholder: apiKey === 'your-api-key-here'
+        isPlaceholder: apiKey === 'your_deepseek_api_key_here'
       });
+      this.isInitialized = false;
       return;
     }
 
     try {
-      this.client = new GoogleGenAI({ apiKey });
-      
-      // Use the configured model name (default: gemini-3.5-flash)
-      this.model = config.get('llm.gemini.model');
+      const providerConfig = this.providerConfig;
+
+      this.client = new DeepSeekClient({
+        apiKey,
+        baseUrl: providerConfig.baseUrl,
+        timeout: providerConfig.timeout,
+        userAgent: this.getUserAgent()
+      });
+
+      this.model = providerConfig.model;
       this.isInitialized = true;
-      
-      logger.info('Gemini AI client initialized successfully', {
-        model: this.model
+
+      logger.info('DeepSeek client initialized successfully', {
+        provider: this.provider,
+        model: this.model,
+        baseUrl: providerConfig.baseUrl,
+        reasoningEffort: providerConfig.reasoningEffort || 'default',
+        timeout: providerConfig.timeout
       });
     } catch (error) {
-      logger.error('Failed to initialize Gemini client', { 
-        error: error.message 
+      logger.error('Failed to initialize DeepSeek client', {
+        error: error.message
       });
+      this.isInitialized = false;
     }
   }
 
   getGenerationConfig(overrides = {}) {
-    const defaults = config.get('llm.gemini.generation') || {};
+    const defaults = this.providerConfig.generation || {};
     const fallback = {
       temperature: 0.7,
-      topK: 40,
-      topP: 0.95,
-      maxOutputTokens: 4096,
-      thinkingConfig: { thinkingBudget: 0 }
+      topP: 0.9,
+      maxOutputTokens: 8192
     };
 
     const merged = { ...fallback, ...defaults, ...overrides };
@@ -63,55 +85,39 @@ class LLMService {
     return request;
   }
 
-  extractTextFromCandidates(response) {
-    // New @google/genai SDK exposes response.text as a convenience getter.
-    if (response && typeof response.text === 'string' && response.text.trim().length > 0) {
-      return {
-        text: response.text.trim(),
-        candidate: response.candidates?.[0] || null,
-        finishReason: response.candidates?.[0]?.finishReason || null
-      };
+  /**
+   * Normalize a DeepSeek result into the {text, finishReason} shape the rest of
+   * this service expects.
+   *
+   * A reasoning model can legitimately return an empty `content` when the
+   * thinking phase exhausts `max_tokens` (finish_reason === 'length'). That is
+   * reported as a specific error instead of a generic parse failure, because
+   * the fix — raise the token budget or lower reasoning effort — is different
+   * from a malformed-response problem.
+   */
+  extractTextFromResult(result) {
+    const text = result && typeof result.text === 'string' ? result.text.trim() : '';
+    const reasoning = result && typeof result.reasoning === 'string' ? result.reasoning : '';
+    const finishReason = (result && result.finishReason) || null;
+
+    if (text.length > 0) {
+      return { text, finishReason, reasoning };
     }
 
-    const candidates = Array.isArray(response?.candidates)
-      ? response.candidates
-      : Array.isArray(response)
-        ? response
-        : [];
-
-    if (!candidates.length) {
-      throw new Error('No candidates in Gemini response');
+    if (finishReason === 'length') {
+      throw new Error(
+        `DeepSeek ran out of tokens while thinking (${reasoning.length} chars of reasoning, no answer). ` +
+        'Raise maxOutputTokens or lower DEEPSEEK_REASONING_EFFORT.'
+      );
     }
 
-    const candidateWithText = candidates.find(candidate => {
-      const parts = candidate?.content?.parts;
-      return Array.isArray(parts) && parts.some(part => typeof part.text === 'string' && part.text.trim().length > 0);
-    });
-
-    if (!candidateWithText) {
-      const finishReasons = candidates.map(c => c.finishReason || 'unknown').join(', ');
-      throw new Error(`No text parts in candidates. Finish reasons: ${finishReasons}`);
-    }
-
-    const textParts = candidateWithText.content.parts
-      .filter(part => typeof part.text === 'string' && part.text.trim().length > 0)
-      .map(part => part.text.trim());
-
-    if (!textParts.length) {
-      throw new Error(`Candidate parts missing text after filtering: ${JSON.stringify(candidateWithText)}`);
-    }
-
-    const text = textParts.join('\n');
-
-    return {
-      text,
-      candidate: candidateWithText,
-      finishReason: candidateWithText.finishReason || null
-    };
+    throw new Error(
+      `DeepSeek returned no answer text${finishReason ? ` (finish_reason: ${finishReason})` : ''}`
+    );
   }
 
   /**
-   * Process an image directly with Gemini using the active skill prompt.
+   * Process an image directly with DeepSeek vision using the active skill prompt.
    * The image buffer is sent as inlineData alongside a concise instruction.
    * For image-based queries, we include the skill prompt (e.g., DSA) as systemInstruction.
    * @param {Buffer} imageBuffer - PNG/JPEG image bytes
@@ -123,7 +129,7 @@ class LLMService {
    */
   async processImageWithSkill(imageBuffer, mimeType, activeSkill, sessionMemory = [], programmingLanguage = null) {
     if (!this.isInitialized) {
-      throw new Error('LLM service not initialized. Check Gemini API key configuration.');
+      throw new Error('LLM service not initialized. Check the DeepSeek API key in Settings.');
     }
 
     if (!imageBuffer || !Buffer.isBuffer(imageBuffer)) {
@@ -156,34 +162,14 @@ class LLMService {
       this.applyGenerationDefaults(request);
 
       if (skillPrompt && skillPrompt.trim().length > 0) {
-        request.systemInstruction = { parts: [{ text: skillPrompt }] };
+        // Skill prompts are English-only, so append the answer-language rule.
+        request.systemInstruction = {
+          parts: [{ text: skillPrompt + this.getResponseLanguageInstruction() }]
+        };
       }
 
-      // Execute with retries/timeout - try alternative method first for network reliability
-      let responseText;
-      const preferAlternative = !!config.get('llm.gemini.enableFallbackMethod');
-      try {
-        if (preferAlternative) {
-          logger.debug('Attempting alternative HTTPS method first for reliability');
-          responseText = await this.executeAlternativeRequest(request);
-        } else {
-          responseText = await this.executeRequest(request);
-        }
-      } catch (error) {
-        const secondaryLabel = preferAlternative ? 'primary SDK method' : 'alternative HTTPS method';
-        logger.warn(`${preferAlternative ? 'Alternative' : 'Primary'} method failed, trying ${secondaryLabel}`, { error: error.message });
-        const secondaryFn = preferAlternative ? this.executeRequest.bind(this) : this.executeAlternativeRequest.bind(this);
-
-        try {
-          responseText = await secondaryFn(request);
-        } catch (secondaryError) {
-          logger.error('Both Gemini request methods failed', {
-            firstError: error.message,
-            secondError: secondaryError.message
-          });
-          throw secondaryError;
-        }
-      }
+      // executeRequest handles retries, timeouts and model fallback internally.
+      const responseText = await this.executeRequest(request);
 
       // Enforce language in code fences if provided
       const finalResponse = programmingLanguage
@@ -218,7 +204,7 @@ class LLMService {
         requestId: this.requestCount
       });
 
-      if (config.get('llm.gemini.fallbackEnabled')) {
+      if (config.get('llm.deepseek.fallbackEnabled')) {
         return this.generateFallbackResponse('[image]', activeSkill);
       }
       throw error;
@@ -227,7 +213,7 @@ class LLMService {
 
   async processImageWithSkillStream(imageBuffer, mimeType, activeSkill, sessionMemory = [], programmingLanguage = null, onDelta = null) {
     if (!this.isInitialized) {
-      throw new Error('LLM service not initialized. Check Gemini API key configuration.');
+      throw new Error('LLM service not initialized. Check the DeepSeek API key in Settings.');
     }
 
     if (!imageBuffer || !Buffer.isBuffer(imageBuffer)) {
@@ -255,7 +241,10 @@ class LLMService {
       };
       this.applyGenerationDefaults(geminiRequest);
       if (skillPrompt && skillPrompt.trim().length > 0) {
-        geminiRequest.systemInstruction = { parts: [{ text: skillPrompt }] };
+        // Skill prompts are English-only, so append the answer-language rule.
+        geminiRequest.systemInstruction = {
+          parts: [{ text: skillPrompt + this.getResponseLanguageInstruction() }]
+        };
       }
 
       const fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
@@ -299,12 +288,12 @@ class LLMService {
 
   formatImageInstruction(activeSkill, programmingLanguage) {
     const langNote = programmingLanguage ? ` Use only ${programmingLanguage.toUpperCase()} for any code.` : '';
-    return `Analyze this image for a ${activeSkill.toUpperCase()} question. Extract the problem concisely and provide the best possible solution with explanation and final code.${langNote}`;
+    return `Analyze this image for a ${activeSkill.toUpperCase()} question. Extract the problem concisely and provide the best possible solution with explanation and final code.${langNote}${this.getResponseLanguageInstruction()}${this._profileHint()}`;
   }
 
   async processTextWithSkill(text, activeSkill, sessionMemory = [], programmingLanguage = null) {
     if (!this.isInitialized) {
-      throw new Error('LLM service not initialized. Check Gemini API key configuration.');
+      throw new Error('LLM service not initialized. Check the DeepSeek API key in Settings.');
     }
 
     const startTime = Date.now();
@@ -321,33 +310,10 @@ class LLMService {
 
       const geminiRequest = this.buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage);
 
-      const preferAlternative = !!config.get('llm.gemini.enableFallbackMethod');
-      let response;
-      try {
-        if (preferAlternative) {
-          logger.debug('Attempting alternative HTTPS method first for text processing');
-          response = await this.executeAlternativeRequest(geminiRequest);
-        } else {
-          response = await this.executeRequest(geminiRequest);
-        }
-      } catch (error) {
-        const secondaryLabel = preferAlternative ? 'primary SDK method' : 'alternative HTTPS method';
-        logger.warn(`${preferAlternative ? 'Alternative' : 'Primary'} method failed, trying ${secondaryLabel}`, {
-          error: error.message,
-          requestId: this.requestCount
-        });
-        const secondaryFn = preferAlternative ? this.executeRequest.bind(this) : this.executeAlternativeRequest.bind(this);
-        try {
-          response = await secondaryFn(geminiRequest);
-        } catch (secondaryError) {
-          logger.error('Both Gemini request methods failed for text processing', {
-            firstError: error.message,
-            secondError: secondaryError.message,
-            requestId: this.requestCount
-          });
-          throw secondaryError;
-        }
-      }
+      // executeRequest already retries internally with backoff, so a second
+      // outer attempt would just double the worst-case wait before the user
+      // sees an error.
+      const response = await this.executeRequest(geminiRequest);
       
       // Enforce language in code fences if programmingLanguage specified
       const finalResponse = programmingLanguage
@@ -381,7 +347,7 @@ class LLMService {
         requestId: this.requestCount
       });
 
-      if (config.get('llm.gemini.fallbackEnabled')) {
+      if (config.get('llm.deepseek.fallbackEnabled')) {
         return this.generateFallbackResponse(text, activeSkill);
       }
 
@@ -391,7 +357,7 @@ class LLMService {
 
   async processTextWithSkillStream(text, activeSkill, sessionMemory = [], programmingLanguage = null, onDelta = null) {
     if (!this.isInitialized) {
-      throw new Error('LLM service not initialized. Check Gemini API key configuration.');
+      throw new Error('LLM service not initialized. Check the DeepSeek API key in Settings.');
     }
 
     const startTime = Date.now();
@@ -439,7 +405,7 @@ class LLMService {
 
   async processTranscriptionWithIntelligentResponse(text, activeSkill, sessionMemory = [], programmingLanguage = null) {
     if (!this.isInitialized) {
-      throw new Error('LLM service not initialized. Check Gemini API key configuration.');
+      throw new Error('LLM service not initialized. Check the DeepSeek API key in Settings.');
     }
 
     const startTime = Date.now();
@@ -456,34 +422,8 @@ class LLMService {
 
       const geminiRequest = this.buildIntelligentTranscriptionRequest(text, activeSkill, sessionMemory, programmingLanguage);
 
-      const preferAlternative = !!config.get('llm.gemini.enableFallbackMethod');
-      let response;
-      try {
-        if (preferAlternative) {
-          logger.debug('Attempting alternative HTTPS method first for transcription processing');
-          response = await this.executeAlternativeRequest(geminiRequest);
-        } else {
-          response = await this.executeRequest(geminiRequest);
-        }
-      } catch (error) {
-        const secondaryLabel = preferAlternative ? 'primary SDK method' : 'alternative HTTPS method';
-        logger.warn(`${preferAlternative ? 'Alternative' : 'Primary'} method failed, trying ${secondaryLabel}`, {
-          error: error.message,
-          requestId: this.requestCount
-        });
-        const secondaryFn = preferAlternative ? this.executeRequest.bind(this) : this.executeAlternativeRequest.bind(this);
-        try {
-          response = await secondaryFn(geminiRequest);
-        } catch (secondaryError) {
-          logger.error('Both Gemini request methods failed for transcription processing', {
-            firstError: error.message,
-            secondError: secondaryError.message,
-            requestId: this.requestCount
-          });
-          throw secondaryError;
-        }
-      }
-      
+      const response = await this.executeRequest(geminiRequest);
+
       // Enforce language in code fences if programmingLanguage specified
       const finalResponse = programmingLanguage
         ? this.enforceProgrammingLanguage(response, programmingLanguage)
@@ -517,7 +457,7 @@ class LLMService {
         requestId: this.requestCount
       });
 
-      if (config.get('llm.gemini.fallbackEnabled')) {
+      if (config.get('llm.deepseek.fallbackEnabled')) {
         return this.generateIntelligentFallbackResponse(text, activeSkill);
       }
       
@@ -608,8 +548,11 @@ class LLMService {
 
     // Use the skill prompt from context (which may already include programming language)
     if (skillContext.skillPrompt) {
+      // The skill prompts are authored in English; without this the model
+      // mirrors that and answers in English. Appending the language rule here
+      // covers the chat/screenshot paths, whose system prompt is the skill.
       request.systemInstruction = {
-        parts: [{ text: skillContext.skillPrompt }]
+        parts: [{ text: skillContext.skillPrompt + this.getResponseLanguageInstruction() }]
       };
       
       logger.debug('Using skill context prompt as system instruction', {
@@ -652,7 +595,7 @@ class LLMService {
       parts: [{ text: formattedMessage }]
     });
 
-    logger.debug('Built Gemini request with conversation history', {
+    logger.debug('Built LLM request with conversation history', {
       skill: activeSkill,
       programmingLanguage: programmingLanguage || 'not specified',
       historyLength: conversationHistory.length,
@@ -727,12 +670,17 @@ class LLMService {
     const conversationContents = conversationHistory
       .filter(event => {
         // Filter out system messages and ensure content exists and is valid
-        return event.role !== 'system' && 
-               event.content && 
-               typeof event.content === 'string' && 
+        return event.role !== 'system' &&
+               event.content &&
+               typeof event.content === 'string' &&
                event.content.trim().length > 0;
       })
-      .slice(-8) // Keep last 8 exchanges for context
+      // Voice history is counted in FRAGMENTS, not turns: DashScope splits one
+      // spoken sentence at every pause, so a single interviewer question plus a
+      // candidate answer can easily be 6-8 fragments. 24 fragments ≈ 3-4 real
+      // exchanges, which is the depth a follow-up ("那第二种呢") needs. The
+      // context cost is a few KB — negligible next to the profile block.
+      .slice(-24) // Keep last ~24 fragments for context
       .map(event => {
         const content = event.content.trim();
         if (!content) {
@@ -762,7 +710,7 @@ class LLMService {
 
     // Ensure we have at least one content item
     if (request.contents.length === 0) {
-      throw new Error('No valid content to send to Gemini API');
+      throw new Error('No valid content to send to the API');
     }
 
     logger.debug('Built intelligent transcription request with conversation history', {
@@ -778,12 +726,172 @@ class LLMService {
     return request;
   }
 
+  /**
+   * Natural-language the model should answer in.
+   *
+   * This is deliberately separate from `programmingLanguage` (the coding
+   * language used for code fences). The prompts are written in English, so
+   * without an explicit instruction the model mirrors the prompt language and
+   * replies in English even when the question was asked in Chinese.
+   */
+  getResponseLanguage() {
+    const configured = String(config.get('llm.responseLanguage') || '').trim();
+    return configured || 'auto';
+  }
+
+  /**
+   * Which speaker the current session is answering: 'interviewer' or 'me'.
+   *
+   * Set by main.js from the live speech routing state (it flips to 'me' when
+   * system-audio capture is unavailable). The prompt builder needs it because
+   * the "don't answer your own words" rule is only valid in 'interviewer'
+   * mode — in 'me' mode those very words are the questions.
+   */
+  setAnsweredSpeaker(speaker) {
+    this.answeredSpeaker = speaker === 'interviewer' ? 'interviewer' : 'me';
+  }
+
+  _getAnsweredSpeaker() {
+    if (this.answeredSpeaker === 'interviewer' || this.answeredSpeaker === 'me') {
+      return this.answeredSpeaker;
+    }
+    // Default to answering the user directly: if routing is unknown, a bare
+    // "OK" reply is the worst possible failure mode.
+    return 'me';
+  }
+
+  /** Human-readable name for a language code, for prompt injection. */
+  _responseLanguageName(code) {
+    const map = {
+      zh: 'Simplified Chinese (简体中文)',
+      'zh-cn': 'Simplified Chinese (简体中文)',
+      'zh-tw': 'Traditional Chinese (繁體中文)',
+      en: 'English',
+      ja: 'Japanese (日本語)',
+      ko: 'Korean (한국어)',
+      es: 'Spanish (Español)',
+      fr: 'French (Français)',
+      de: 'German (Deutsch)',
+      ru: 'Russian (Русский)',
+      pt: 'Portuguese (Português)',
+      it: 'Italian (Italiano)',
+      hi: 'Hindi (हिन्दी)',
+      ar: 'Arabic (العربية)'
+    };
+    return map[String(code).toLowerCase()] || code;
+  }
+
+  /**
+   * Build the "answer in language X" instruction, or '' when set to auto.
+   * Auto means: match whatever language the user wrote/spoke in.
+   */
+  getResponseLanguageInstruction() {
+    const lang = this.getResponseLanguage();
+    if (!lang || lang === 'auto') {
+      return '\n\nLANGUAGE: Reply in the SAME natural language the user used. ' +
+        'If the question is in Chinese, answer in Chinese; if in English, answer in English. ' +
+        'Code identifiers and keywords stay in the programming language.';
+    }
+    const name = this._responseLanguageName(lang);
+    return `\n\nLANGUAGE: Always write your explanation in ${name}, regardless of the language of the question. ` +
+      'Keep code identifiers, keywords, and standard technical terms in their original form.';
+  }
+
   getIntelligentTranscriptionPrompt(activeSkill, programmingLanguage) {
+    // Which voice the app was configured to answer. This matters enormously:
+    // the "stay quiet on your own lines" rule below is only correct when the
+    // INTERVIEWER is the one being answered. If the app has fallen back to the
+    // microphone (no system-audio capture), the candidate's own lines ARE the
+    // questions, and applying that rule would make every reply a bare "OK".
+    const answeredSpeaker = this._getAnsweredSpeaker();
+
     let prompt = `# Intelligent Transcription Response System
 
-Assume you are asked a question in ${activeSkill.toUpperCase()} mode. Your job is to intelligently respond to question/message with appropriate brevity.
-Assume you are in an interview and you need to perform best in ${activeSkill.toUpperCase()} mode.
-Always respond to the point, do not repeat the question or unnecessary information which is not related to ${activeSkill}.`;
+You are an interview copilot. You receive live speech transcripts from up to TWO
+speakers, each line prefixed with a tag:
+
+  [面试官] / [Interviewer] — the person interviewing you. Their lines are
+      usually questions, problem statements, or follow-ups.
+  [我] / [Me] — you, the candidate. These are your own words: thinking out
+      loud, partial answers, filler, or questions you asked back.
+`;
+
+    if (answeredSpeaker === 'interviewer') {
+      prompt += `
+WHO TO ANSWER: the interviewer ([面试官]).
+
+- Treat the interviewer's lines as the task to solve. Answer them.
+- Treat your own [我] lines as context about what you have already said or are
+  currently saying. NEVER answer your own sentence, and never treat your own
+  words as a new question — unless they are clearly addressed to the AI.
+- If a message contains ONLY your own [我] lines, reply with exactly "OK" and
+  nothing else. Do not explain, do not apologise, do not summarise.
+`;
+    } else {
+      prompt += `
+WHO TO ANSWER: the candidate ([我]) — that is the user of this app.
+
+The interviewer's audio channel is not available right now, so the user is
+speaking their questions directly. Every [我] line is something the user wants
+help with, even when phrased as a statement or a fragment rather than a
+question.
+
+- ALWAYS answer [我] lines. Never reply with a bare "OK" — that is an error in
+  this mode.
+- If an [面试官] line does arrive, it is background audio; use it as context
+  and still answer the [我] line.
+`;
+    }
+
+    prompt += `
+HOW TO ANSWER
+- If the line you are answering is small talk, logistics, or unrelated to
+  ${activeSkill.toUpperCase()}, reply with a short acknowledgment such as
+  "Yeah, I'm listening. Ask your question relevant to ${activeSkill}."
+- If it IS a ${activeSkill.toUpperCase()} question or a follow-up, give a
+  complete, detailed answer.
+- Lines without any tag are the user typing directly to you: always answer them.
+- Judge the content, not the punctuation: a spoken question often arrives
+  without a question mark ("讲一下快速排序" or "explain quicksort"), and a
+  fragment cut off mid-sentence is still a request for help.
+`;
+
+    // Follow-up awareness (方案 B). Spoken interviews are full of references:
+    // the interviewer completes a thought two turns later, asks "那第二种呢？"
+    // or "你刚才说的那个方案", or drills into something the candidate just
+    // said. Treating such a line as a standalone question produces a confident
+    // answer to a question nobody asked.
+    prompt += `
+FOLLOW-UPS AND REFERENCE RESOLUTION (very important)
+
+Interview speech is full of references instead of self-contained questions.
+Before answering, ALWAYS resolve what the line actually refers to, using both
+the conversation history above and the candidate profile below.
+
+Typical patterns you must handle:
+1. Ellipsis / continuation — the interviewer adds a clause to their previous
+   sentence ("……那如果并发再高一个量级呢？"). Treat it as continuing that
+   sentence, and answer the combined question.
+2. Pronoun / demonstrative references — "那第二种呢", "为什么不用它",
+   "这个方案有什么问题". Find the specific thing in recent history ("第二种"
+   = the second option that was listed or discussed) and answer about THAT.
+3. References to the candidate's own answers — "你刚才说召回率提升了，
+   具体怎么做的？". The answer must be consistent with what the profile and
+   history actually say, not a new invention.
+4. Drill-downs — "为什么选 X 不选 Y", "深入讲讲刚才那个难点". Expand on the
+   specific item from history/profile.
+
+Resolution procedure:
+- If the line is short or contains 指代词 (那/这个/它/第二种/刚才/你说的),
+  scan the recent history for the referent BEFORE composing any answer.
+- When resolved, you may briefly restate the resolved referent ("你指的是
+  Token Bucket 方案——") so the candidate can confirm, then answer it fully.
+- If the referent is genuinely ambiguous and no plausible reading exists in
+  history, ask ONE short clarifying question instead of guessing.
+`;
+
+    // Natural-language of the answer (independent of the coding language).
+    prompt += this.getResponseLanguageInstruction();
 
     // Add programming language context if provided
     if (programmingLanguage) {
@@ -831,27 +939,91 @@ If the user's input is a coding or DSA problem statement and contains no code, p
 
 Remember: Be intelligent about filtering - only provide detailed responses when the user actually needs help with ${activeSkill}.`;
 
+    // Plan A: the candidate's real background. Appended last so it sits closest
+    // to the conversation, and only when a profile actually exists — with no
+    // profile this block is empty and the prompt behaves exactly as before.
+    const profileContext = profileLoader.getProfileContext();
+    if (profileContext) {
+      prompt += profileContext;
+    } else {
+      // Guard against confident fabrication when nothing is known.
+      prompt += `
+
+# CANDIDATE PROFILE: not provided
+
+No resume/project material is loaded. When asked about "你的项目/你的经历/你的简历",
+do NOT invent employers, projects, numbers or outcomes. Say plainly that this
+detail has not been configured in the app (in one short clause), then offer the
+general/industry-standard answer the candidate can adapt.`;
+    }
+
     return prompt;
   }
 
   formatUserMessage(text, activeSkill) {
-    return `Context: ${activeSkill.toUpperCase()} analysis request\n\nText to analyze:\n${text}`;
+    // The language instruction rides along with the user turn so it applies to
+    // every path (chat, screenshot, voice) without editing each skill prompt.
+    return `Context: ${activeSkill.toUpperCase()} analysis request${this.getResponseLanguageInstruction()}${this._profileHint()}\n\nText to analyze:\n${text}`;
+  }
+
+  /**
+   * Short per-turn reminder that personal facts must come from the profile.
+   *
+   * The full profile block is only injected into the voice-transcript system
+   * prompt (it is large); the chat/screenshot paths carry the skill prompt as
+   * their system instruction, so a one-line rule here keeps those paths honest
+   * too without bloating every request with the whole resume.
+   */
+  _profileHint() {
+    if (!profileLoader.hasProfile()) return '';
+    return '\n(CANDIDATE PROFILE is loaded: answer "你的项目/你的经历" questions only from it; never invent numbers or projects.)';
+  }
+
+  /** Build the DeepSeek params for a request, applying config defaults. */
+  _paramsForRequest(request, overrides = {}) {
+    const generation = request.generationConfig || {};
+    return toDeepSeekParams(request, {
+      model: this.model,
+      maxTokens: generation.maxOutputTokens,
+      temperature: generation.temperature,
+      topP: generation.topP,
+      reasoningEffort: this.providerConfig.reasoningEffort,
+      ...overrides
+    });
+  }
+
+  /**
+   * True when an error is worth retrying. Auth errors, bad requests and
+   * missing models will fail identically on every attempt, so retrying them
+   * only delays the error the user needs to see.
+   */
+  _isRetryable(error) {
+    if (error instanceof DeepSeekApiError && error.statusCode != null) {
+      const status = error.statusCode;
+      // 401/403 (auth), 400/404/422 (bad request / unknown model) are terminal.
+      if (status === 401 || status === 403 || status === 400 || status === 404 || status === 422) {
+        return false;
+      }
+      // 408/409/429/5xx and anything else transient is retryable.
+      return true;
+    }
+    // Network-level failures (socket, DNS, timeout) are retryable.
+    return true;
   }
 
   async executeRequest(geminiRequest) {
-    const maxRetries = config.get('llm.gemini.maxRetries');
-    const timeout = config.get('llm.gemini.timeout');
+    const maxRetries = config.get('llm.deepseek.maxRetries');
     const primaryModel = this.model;
-    const fallbackModels = config.get('llm.gemini.fallbackModels') || [];
-    const modelsToTry = [primaryModel, ...fallbackModels];
+    const fallbackModels = config.get('llm.deepseek.fallbackModels') || [];
+    const modelsToTry = [primaryModel, ...fallbackModels].filter(Boolean);
 
-    logger.debug('Executing Gemini request', {
+    logger.debug('Executing DeepSeek request', {
       hasModel: !!this.model,
       hasClient: !!this.client,
       requestKeys: Object.keys(geminiRequest),
-      timeout,
       maxRetries,
       modelsToTry,
+      provider: this.provider,
       nodeVersion: process.version,
       platform: process.platform
     });
@@ -861,42 +1033,34 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
     for (const modelName of modelsToTry) {
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-          const timeoutPromise = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('Request timeout')), timeout)
-          );
+          const params = this._paramsForRequest(geminiRequest, { model: modelName });
 
-          logger.debug(`Gemini API attempt ${attempt} starting with model ${modelName}`, {
+          logger.debug(`DeepSeek API attempt ${attempt} starting`, {
             timestamp: new Date().toISOString(),
-            timeout,
-            model: modelName
-          });
-
-          const requestPromise = this.client.models.generateContent({
             model: modelName,
-            contents: geminiRequest.contents,
-            config: geminiRequest.generationConfig,
-            systemInstruction: geminiRequest.systemInstruction
+            messageCount: params.messages.length,
+            maxTokens: params.maxTokens,
+            reasoningEffort: params.reasoningEffort || 'default'
           });
-          const result = await Promise.race([requestPromise, timeoutPromise]);
 
-          if (!result) {
-            throw new Error('Empty response from Gemini API');
-          }
+          const result = await this.client.createChatCompletion(params);
+          const { text, finishReason, reasoning } = this.extractTextFromResult(result);
 
-          const { text, finishReason } = this.extractTextFromCandidates(result);
-
-          if (finishReason === 'MAX_TOKENS') {
-            logger.warn('Gemini response reached max tokens limit', {
+          if (finishReason === 'length') {
+            logger.warn('DeepSeek response hit the max tokens limit', {
               attempt,
               finishReason,
-              model: modelName
+              model: modelName,
+              maxTokens: params.maxTokens,
+              reasoningChars: reasoning.length
             });
           }
 
-          logger.debug('Gemini API request successful', {
+          logger.debug('DeepSeek API request successful', {
             attempt,
             model: modelName,
             responseLength: text.length,
+            reasoningChars: reasoning.length,
             finishReason
           });
 
@@ -905,44 +1069,23 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
           const errorInfo = this.analyzeError(error);
           lastError = error;
 
-          // Enhanced error logging for fetch failures
-          if (errorInfo.type === 'NETWORK_ERROR') {
-            logger.error('Network error details', {
-              attempt,
-              model: modelName,
-              errorMessage: error.message,
-              errorStack: error.stack,
-              errorName: error.name,
-              nodeEnv: process.env.NODE_ENV,
-              electronVersion: process.versions.electron,
-              chromeVersion: process.versions.chrome,
-              nodeVersion: process.versions.node,
-              userAgent: this.getUserAgent()
-            });
-          }
-
-          logger.warn(`Gemini API attempt ${attempt} failed for model ${modelName}`, {
+          logger.warn(`DeepSeek API attempt ${attempt} failed for model ${modelName}`, {
             error: error.message,
             errorType: errorInfo.type,
+            statusCode: error.statusCode || null,
             isNetworkError: errorInfo.isNetworkError,
             suggestedAction: errorInfo.suggestedAction,
             remainingAttempts: maxRetries - attempt,
             model: modelName
           });
 
-          // For model-unavailable / overloaded / rate-limit errors, move to
-          // the next fallback model immediately instead of burning all retries.
-          const isModelUnavailable = errorInfo.type === 'RATE_LIMIT_ERROR' ||
-            error.message.includes('503') ||
-            error.message.includes('UNAVAILABLE') ||
-            error.message.includes('high demand');
-
-          if (isModelUnavailable && modelName !== modelsToTry[modelsToTry.length - 1]) {
-            logger.info(`Switching to fallback model after ${modelName} unavailable`, {
-              model: modelName,
-              error: error.message
+          if (!this._isRetryable(error)) {
+            logger.error('DeepSeek request failed with a non-retryable error', {
+              error: error.message,
+              statusCode: error.statusCode || null,
+              model: modelName
             });
-            break; // exit retry loop for this model and try next model
+            throw error;
           }
 
           if (attempt === maxRetries) {
@@ -965,7 +1108,9 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
     }
 
     const finalErrorInfo = this.analyzeError(lastError);
-    const finalError = new Error(`Gemini API failed after trying ${modelsToTry.join(', ')}: ${lastError?.message}`);
+    const finalError = new Error(
+      `DeepSeek API failed after trying ${modelsToTry.join(', ')}: ${lastError?.message}`
+    );
     finalError.errorAnalysis = finalErrorInfo;
     finalError.originalError = lastError;
     throw finalError;
@@ -980,7 +1125,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
    */
   async processTranscriptionWithIntelligentResponseStream(text, activeSkill, sessionMemory = [], programmingLanguage = null, onDelta = null) {
     if (!this.isInitialized) {
-      throw new Error('LLM service not initialized. Check Gemini API key configuration.');
+      throw new Error('LLM service not initialized. Check the DeepSeek API key in Settings.');
     }
 
     const startTime = Date.now();
@@ -1029,73 +1174,77 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
     }
   }
 
-  /** Safely pull the text delta out of a streamed Gemini chunk. */
-  _extractChunkText(chunk) {
-    try {
-      const t = chunk && chunk.text;
-      if (typeof t === 'string') {
-        return t;
-      }
-    } catch (_) {
-      // `.text` getter can throw on non-text parts; fall through to manual read.
-    }
-    try {
-      const parts = (chunk && chunk.candidates && chunk.candidates[0] &&
-        chunk.candidates[0].content && chunk.candidates[0].content.parts) || [];
-      return parts.map((p) => (p && typeof p.text === 'string' ? p.text : '')).join('');
-    } catch (_) {
-      return '';
-    }
-  }
-
   /**
-   * Run a streaming Gemini request with the same model-fallback + retry policy
-   * as executeRequest. Accumulates and returns the full text; invokes onDelta
-   * for each chunk.
+   * Run a streaming DeepSeek request with the same model-fallback + retry
+   * policy as executeRequest. Accumulates and returns the full text; invokes
+   * onDelta for each answer chunk.
+   *
+   * Retry safety: once a delta has been handed to the UI, retrying would
+   * re-emit the beginning of the answer into a bubble that already shows it.
+   * So a failure after the first delta is surfaced immediately rather than
+   * retried — the caller's non-streaming fallback then produces one clean
+   * answer instead of a spliced-together duplicate.
    */
   async executeStreamingRequest(geminiRequest, onDelta) {
-    const maxRetries = config.get('llm.gemini.maxRetries');
-    const apiKey = config.getApiKey('GEMINI');
+    const maxRetries = config.get('llm.deepseek.maxRetries');
     const primaryModel = this.model;
-    const fallbackModels = config.get('llm.gemini.fallbackModels') || [];
-    const modelsToTry = [primaryModel, ...fallbackModels];
+    const fallbackModels = config.get('llm.deepseek.fallbackModels') || [];
+    const modelsToTry = [primaryModel, ...fallbackModels].filter(Boolean);
 
     let lastError = null;
 
     for (const modelName of modelsToTry) {
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        let emitted = false;
+
         try {
-          const fullText = await this._streamRequestForModel(geminiRequest, modelName, apiKey, onDelta);
+          const params = this._paramsForRequest(geminiRequest, { model: modelName });
 
-          if (!fullText) {
-            throw new Error('Empty streamed response from Gemini API');
-          }
-
-          logger.debug('Gemini streaming request successful', {
-            attempt,
-            model: modelName,
-            responseLength: fullText.length
+          const result = await this.client.streamChatCompletion(params, (delta) => {
+            emitted = true;
+            if (typeof onDelta === 'function') onDelta(delta);
           });
 
-          return fullText;
+          const { text, reasoning, finishReason } = this.extractTextFromResult(result);
+
+          if (finishReason === 'length') {
+            logger.warn('DeepSeek streamed response hit the max tokens limit', {
+              attempt,
+              model: modelName,
+              maxTokens: params.maxTokens,
+              reasoningChars: reasoning.length
+            });
+          }
+
+          logger.debug('DeepSeek streaming request successful', {
+            attempt,
+            model: modelName,
+            responseLength: text.length,
+            reasoningChars: reasoning.length,
+            finishReason
+          });
+
+          return text;
         } catch (error) {
           const errorInfo = this.analyzeError(error);
           lastError = error;
 
-          logger.warn(`Gemini streaming attempt ${attempt} failed for model ${modelName}`, {
+          logger.warn(`DeepSeek streaming attempt ${attempt} failed for model ${modelName}`, {
             error: error.message,
             errorType: errorInfo.type,
+            statusCode: error.statusCode || null,
+            emittedDeltas: emitted,
             remainingAttempts: maxRetries - attempt,
             model: modelName
           });
 
-          const isModelUnavailable = errorInfo.type === 'RATE_LIMIT_ERROR' ||
-            error.message.includes('503') ||
-            error.message.includes('UNAVAILABLE') ||
-            error.message.includes('high demand');
+          // Partial output already reached the UI: retrying would duplicate it.
+          if (emitted) {
+            throw error;
+          }
 
-          if (isModelUnavailable && modelName !== modelsToTry[modelsToTry.length - 1]) {
-            break; // try next fallback model
+          if (!this._isRetryable(error)) {
+            throw error;
           }
 
           if (attempt === maxRetries) {
@@ -1109,103 +1258,37 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
       }
     }
 
-    throw lastError || new Error('Gemini streaming request failed');
-  }
-
-  _streamRequestForModel(geminiRequest, modelName, apiKey, onDelta) {
-    const https = require('https');
-    const timeout = config.get('llm.gemini.timeout');
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:streamGenerateContent?alt=sse`;
-    const postData = JSON.stringify(geminiRequest);
-    const agent = new https.Agent({ keepAlive: true, maxSockets: 1 });
-
-    const options = {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': apiKey,
-        'Content-Length': Buffer.byteLength(postData),
-        'User-Agent': this.getUserAgent()
-      },
-      timeout,
-      agent
-    };
-
-    return new Promise((resolve, reject) => {
-      const req = https.request(url, options, (res) => {
-        if (res.statusCode !== 200) {
-          let errBody = '';
-          res.on('data', (c) => { errBody += c; });
-          res.on('end', () => reject(new Error(`HTTP ${res.statusCode}: ${errBody}`)));
-          return;
-        }
-
-        let fullText = '';
-        let buffer = '';
-
-        res.setEncoding('utf8');
-        res.on('data', (chunk) => {
-          buffer += chunk;
-          let idx;
-          while ((idx = buffer.indexOf('\n')) !== -1) {
-            const line = buffer.slice(0, idx).trim();
-            buffer = buffer.slice(idx + 1);
-            if (!line.startsWith('data:')) {
-              continue;
-            }
-            const payload = line.slice(5).trim();
-            if (!payload || payload === '[DONE]') {
-              continue;
-            }
-            try {
-              const json = JSON.parse(payload);
-              const piece = this._extractChunkText(json);
-              if (piece) {
-                fullText += piece;
-                if (typeof onDelta === 'function') {
-                  onDelta(piece);
-                }
-              }
-            } catch (_) {
-              // Partial JSON across chunk boundaries is rare with line framing;
-              // skip anything that doesn't parse cleanly.
-            }
-          }
-        });
-
-        res.on('end', () => resolve(fullText.trim()));
-        res.on('error', (error) => reject(new Error(`Streaming response error: ${error.message}`)));
-      });
-
-      req.on('error', (error) => reject(new Error(`Streaming request failed: ${error.message}`)));
-      req.on('timeout', () => {
-        req.destroy();
-        reject(new Error('Streaming request timeout'));
-      });
-
-      req.write(postData);
-      req.end();
-    });
+    throw lastError || new Error('DeepSeek streaming request failed');
   }
 
   async performPreflightCheck() {
-    // Quick connectivity check
+    // Quick connectivity check against the active provider's endpoint.
     try {
       const startTime = Date.now();
-      await this.testNetworkConnection({ 
-        host: 'generativelanguage.googleapis.com', 
-        port: 443, 
-        name: 'Gemini API Endpoint' 
+      const host = this._providerHost();
+      await this.testNetworkConnection({
+        host,
+        port: 443,
+        name: 'DeepSeek API Endpoint'
       });
       const latency = Date.now() - startTime;
-      
-      logger.debug('Preflight check passed', { latency });
+
+      logger.debug('Preflight check passed', { latency, host });
     } catch (error) {
-      logger.warn('Preflight check failed', { 
+      logger.warn('Preflight check failed', {
         error: error.message,
         suggestion: 'Network connectivity issue detected before API call'
       });
       // Don't throw here - let the actual API call fail with more detail
+    }
+  }
+
+  /** Hostname of the configured provider endpoint, for connectivity checks. */
+  _providerHost() {
+    try {
+      return new URL(this.providerConfig.baseUrl || 'https://api.deepseek.com/v1').hostname;
+    } catch (_) {
+      return 'api.deepseek.com';
     }
   }
 
@@ -1222,13 +1305,55 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
   }
 
   analyzeError(error) {
-    const errorMessage = error.message.toLowerCase();
-    
+    const errorMessage = (error && error.message ? error.message : '').toLowerCase();
+    const status = error && error.statusCode ? error.statusCode : null;
+
+    // HTTP status codes are the most reliable signal when present.
+    if (status != null) {
+      if (status === 401 || status === 403) {
+        return {
+          type: 'AUTH_ERROR',
+          isNetworkError: false,
+          suggestedAction: 'Verify the DeepSeek API key in Settings'
+        };
+      }
+      if (status === 429) {
+        return {
+          type: 'RATE_LIMIT_ERROR',
+          isNetworkError: false,
+          suggestedAction: 'Wait before retrying or check your DeepSeek balance'
+        };
+      }
+      if (status === 402) {
+        return {
+          type: 'BALANCE_ERROR',
+          isNetworkError: false,
+          suggestedAction: 'Your DeepSeek account balance is insufficient — top up at platform.deepseek.com'
+        };
+      }
+      if (status === 400 || status === 404 || status === 422) {
+        return {
+          type: 'MODEL_ERROR',
+          isNetworkError: false,
+          suggestedAction: 'The configured model or request is not accepted by DeepSeek'
+        };
+      }
+      if (status === 408 || status >= 500) {
+        return {
+          type: 'NETWORK_ERROR',
+          isNetworkError: true,
+          suggestedAction: 'DeepSeek is unreachable or overloaded — retrying'
+        };
+      }
+    }
+
     // Network connectivity errors
-    if (errorMessage.includes('fetch failed') || 
+    if (errorMessage.includes('fetch failed') ||
         errorMessage.includes('network error') ||
         errorMessage.includes('enotfound') ||
         errorMessage.includes('econnrefused') ||
+        errorMessage.includes('econnreset') ||
+        errorMessage.includes('socket hang up') ||
         errorMessage.includes('timeout')) {
       return {
         type: 'NETWORK_ERROR',
@@ -1236,20 +1361,31 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
         suggestedAction: 'Check internet connection and firewall settings'
       };
     }
-    
-    // API key errors
-    if (errorMessage.includes('unauthorized') || 
+
+    // API key errors reported as text rather than a status code
+    if (errorMessage.includes('unauthorized') ||
+        errorMessage.includes('authentication') ||
         errorMessage.includes('invalid api key') ||
         errorMessage.includes('forbidden')) {
       return {
         type: 'AUTH_ERROR',
         isNetworkError: false,
-        suggestedAction: 'Verify Gemini API key configuration'
+        suggestedAction: 'Verify the DeepSeek API key in Settings'
       };
     }
-    
+
+    // Balance / quota
+    if (errorMessage.includes('insufficient') ||
+        errorMessage.includes('balance')) {
+      return {
+        type: 'BALANCE_ERROR',
+        isNetworkError: false,
+        suggestedAction: 'Your DeepSeek account balance is insufficient — top up at platform.deepseek.com'
+      };
+    }
+
     // Rate limiting
-    if (errorMessage.includes('quota') || 
+    if (errorMessage.includes('quota') ||
         errorMessage.includes('rate limit') ||
         errorMessage.includes('too many requests')) {
       return {
@@ -1258,7 +1394,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
         suggestedAction: 'Wait before retrying or check API quota'
       };
     }
-    
+
     // Timeout errors
     if (errorMessage.includes('request timeout') || errorMessage.includes('etimedout')) {
       return {
@@ -1277,18 +1413,23 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
 
   async checkNetworkConnectivity() {
     const connectivityTests = [
-      { host: 'google.com', port: 443, name: 'Google (HTTPS)' },
-      { host: 'generativelanguage.googleapis.com', port: 443, name: 'Gemini API Endpoint' }
+      { host: 'api.deepseek.com', port: 443, name: 'DeepSeek API Endpoint' },
+      { host: this._providerHost(), port: 443, name: 'Configured LLM Endpoint' }
     ];
 
+    // De-duplicate when the configured base URL is the default endpoint.
+    const uniqueTests = connectivityTests.filter(
+      (test, index) => connectivityTests.findIndex(t => t.host === test.host) === index
+    );
+
     const results = await Promise.allSettled(
-      connectivityTests.map(test => this.testNetworkConnection(test))
+      uniqueTests.map(test => this.testNetworkConnection(test))
     );
 
     const connectivity = {
       timestamp: new Date().toISOString(),
       tests: results.map((result, index) => ({
-        ...connectivityTests[index],
+        ...uniqueTests[index],
         success: result.status === 'fulfilled' && result.value,
         error: result.status === 'rejected' ? result.reason.message : null
       }))
@@ -1330,7 +1471,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
       'dsa': 'This appears to be a data structures and algorithms problem. Consider breaking it down into smaller components and identifying the appropriate algorithm or data structure to use.',
       'system-design': 'For this system design question, consider scalability, reliability, and the trade-offs between different architectural approaches.',
       'programming': 'This looks like a programming challenge. Focus on understanding the requirements, edge cases, and optimal time/space complexity.',
-      'default': 'I can help analyze this content. Please ensure your Gemini API key is properly configured for detailed analysis.'
+      'default': 'I can help analyze this content. Please ensure your DeepSeek API key is properly configured for detailed analysis.'
     };
 
     const response = fallbackResponses[activeSkill] || fallbackResponses.default;
@@ -1403,9 +1544,9 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
         logger.warn('Network connectivity issues detected', networkCheck);
       }
 
-      const generationConfig = this.getGenerationConfig({ temperature: 0, maxOutputTokens: 64 });
-      const fallbackModels = config.get('llm.gemini.fallbackModels') || [];
-      const modelsToTry = [this.model, ...fallbackModels];
+      const generationConfig = this.getGenerationConfig({ temperature: 0, maxOutputTokens: 512 });
+      const fallbackModels = config.get('llm.deepseek.fallbackModels') || [];
+      const modelsToTry = [this.model, ...fallbackModels].filter(Boolean);
 
       let lastError = null;
       let result = null;
@@ -1414,14 +1555,19 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
       for (const modelName of modelsToTry) {
         try {
           const startTime = Date.now();
-          result = await this.client.models.generateContent({
+          // Thinking is disabled for the probe: we only need to confirm the key
+          // works and the model answers, and reasoning tokens would otherwise
+          // eat the small probe budget and return empty content.
+          result = await this.client.createChatCompletion({
             model: modelName,
-            contents: 'Test connection. Please respond with "OK".',
-            config: generationConfig
+            messages: [{ role: 'user', content: 'Test connection. Please respond with "OK".' }],
+            maxTokens: generationConfig.maxOutputTokens,
+            temperature: generationConfig.temperature,
+            reasoningEffort: 'none'
           });
           usedModel = modelName;
           const latency = Date.now() - startTime;
-          const { text } = this.extractTextFromCandidates(result);
+          const { text } = this.extractTextFromResult(result);
 
           logger.info('Connection test successful', {
             response: text,
@@ -1441,17 +1587,13 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
           lastError = error;
           logger.warn(`Connection test failed for model ${modelName}`, {
             error: error.message,
+            statusCode: error.statusCode || null,
             model: modelName
           });
 
-          const isModelUnavailable = error.message.includes('503') ||
-            error.message.includes('UNAVAILABLE') ||
-            error.message.includes('high demand') ||
-            error.message.includes('quota') ||
-            error.message.includes('rate limit');
-
-          if (!isModelUnavailable && modelName === this.model) {
-            // Primary model failed for a non-availability reason; don't hide it
+          // Only fall through to the next model when this one is unavailable;
+          // an auth or bad-request failure will repeat on every model.
+          if (!this._isRetryable(error)) {
             break;
           }
         }
@@ -1465,9 +1607,8 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
         errorAnalysis
       });
 
-      // Map raw SDK errors to user-friendly messages. The wizard only
-      // surfaces `error`, so any raw SDK error string would land in the
-      // UI verbatim.
+      // The onboarding wizard only surfaces `error`, so map raw API failures
+      // to something the user can act on.
       const friendlyError = this._friendlyTestError(error, errorAnalysis);
 
       return {
@@ -1481,175 +1622,60 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
   }
 
   /**
-   * Translate raw SDK / network errors into something a user can act on.
+   * Translate raw API / network errors into something a user can act on.
    */
   _friendlyTestError(error, analysis) {
     const type = analysis?.type;
     const raw = (error?.message || '').toLowerCase();
 
-    if (type === 'NETWORK_ERROR' || raw.includes('fetch failed') || raw.includes('enotfound')) {
-      return 'Cannot reach Google servers. Check your internet connection, firewall, or VPN settings.';
+    if (type === 'AUTH_ERROR' || raw.includes('401') || raw.includes('403') || raw.includes('authentication')) {
+      return 'Invalid DeepSeek API key. Check the key at platform.deepseek.com/api_keys.';
     }
-    if (type === 'AUTH_ERROR' || raw.includes('api key') || raw.includes('401') || raw.includes('403')) {
-      return 'Invalid API key or insufficient permissions. Double-check the key at aistudio.google.com/apikey.';
+    if (type === 'BALANCE_ERROR' || raw.includes('insufficient') || raw.includes('balance')) {
+      return 'Your DeepSeek account has insufficient balance. Top up at platform.deepseek.com.';
     }
-    if (type === 'RATE_LIMIT_ERROR' || raw.includes('429') || raw.includes('quota')) {
-      return 'Rate limit or quota exceeded. Wait a moment or check your Google Cloud billing.';
+    if (type === 'RATE_LIMIT_ERROR' || raw.includes('429') || raw.includes('rate limit')) {
+      return 'Rate limit reached. Wait a moment and try again.';
+    }
+    if (type === 'MODEL_ERROR' || raw.includes('model')) {
+      return 'The configured model is unavailable. Supported models: deepseek-flash, deepseek-v4-pro.';
+    }
+    if (type === 'NETWORK_ERROR' || raw.includes('enotfound') || raw.includes('econnrefused')) {
+      return 'Cannot reach api.deepseek.com. Check your internet connection, firewall, or VPN settings.';
     }
     if (type === 'TIMEOUT_ERROR') {
-      return 'Request timed out. The Google API may be slow or unreachable right now.';
+      return 'Request timed out. DeepSeek may be slow or unreachable right now.';
     }
-    if (type === 'MODEL_ERROR' || raw.includes('model') || raw.includes('404')) {
-      return 'The configured Gemini model is unavailable. Try a different model in Settings.';
-    }
-    if (raw.includes('503') || raw.includes('unavailable') || raw.includes('high demand')) {
-      return 'Gemini is experiencing high demand. Please wait a moment and try again.';
-    }
-    // Fall back to a stripped-down raw message (no SDK prefix noise)
-    return (error?.message || 'Connection failed').replace(/^\[(GoogleGenerativeAI|GoogleGenAI) Error\]:\s*/i, '');
+    return error?.message || 'Connection failed';
   }
 
   updateApiKey(newApiKey) {
-    process.env.GEMINI_API_KEY = newApiKey;
+    process.env.DEEPSEEK_API_KEY = newApiKey;
     this.isInitialized = false;
     this.initializeClient();
-    
-    logger.info('API key updated and client reinitialized');
+
+    logger.info('DeepSeek API key updated and client reinitialized');
   }
 
   getStats() {
+    const providerConfig = this.providerConfig || {};
     return {
       isInitialized: this.isInitialized,
+      // `hasApiKey` / `model` are what the config modal in main-window.js reads;
+      // keeping them top-level avoids the modal showing "Not Configured" for a
+      // working setup.
+      hasApiKey: !!config.getApiKey('DEEPSEEK') && this.isInitialized,
+      model: this.model,
+      provider: this.provider,
       requestCount: this.requestCount,
       errorCount: this.errorCount,
       successRate: this.requestCount > 0 ? ((this.requestCount - this.errorCount) / this.requestCount) * 100 : 0,
-      config: config.get('llm.gemini')
+      config: providerConfig
     };
   }
 
   delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  async executeAlternativeRequest(geminiRequest) {
-    const https = require('https');
-    const apiKey = config.getApiKey('GEMINI');
-    const primaryModel = config.get('llm.gemini.model');
-    const fallbackModels = config.get('llm.gemini.fallbackModels') || [];
-    const modelsToTry = [primaryModel, ...fallbackModels];
-
-    logger.info('Using alternative HTTPS request method', { modelsToTry });
-
-    let lastError = null;
-
-    for (const modelName of modelsToTry) {
-      try {
-        const result = await this._executeAlternativeRequestForModel(geminiRequest, modelName, apiKey);
-        return result;
-      } catch (error) {
-        lastError = error;
-        logger.warn(`Alternative HTTPS request failed for model ${modelName}`, {
-          error: error.message,
-          model: modelName
-        });
-
-        const isModelUnavailable = error.message.includes('503') ||
-          error.message.includes('UNAVAILABLE') ||
-          error.message.includes('high demand');
-
-        if (!isModelUnavailable && modelName === primaryModel) {
-          break;
-        }
-      }
-    }
-
-    throw lastError || new Error('Alternative HTTPS request failed for all models');
-  }
-
-  async _executeAlternativeRequestForModel(geminiRequest, modelName, apiKey) {
-    const https = require('https');
-
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent`;
-
-    const postData = JSON.stringify(geminiRequest);
-
-    const agent = new https.Agent({ keepAlive: true, maxSockets: 1 });
-
-    const options = {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': apiKey,
-        'Content-Length': Buffer.byteLength(postData),
-        'User-Agent': this.getUserAgent()
-      },
-      timeout: config.get('llm.gemini.timeout'),
-      agent
-    };
-
-    return new Promise((resolve, reject) => {
-      const req = https.request(url, options, (res) => {
-        let data = '';
-        
-        res.on('data', (chunk) => {
-          data += chunk;
-        });
-        
-        res.on('end', () => {
-          try {
-            if (res.statusCode !== 200) {
-              reject(new Error(`HTTP ${res.statusCode}: ${data}`));
-              return;
-            }
-            
-            const response = JSON.parse(data);
-            
-            logger.debug('Alternative request response structure', {
-              hasResponse: !!response,
-              hasCandidates: !!response.candidates,
-              candidatesLength: response.candidates?.length,
-              responseKeys: Object.keys(response || {}),
-              firstCandidateKeys: response.candidates?.[0] ? Object.keys(response.candidates[0]) : []
-            });
-
-            const { text, finishReason } = this.extractTextFromCandidates(response);
-
-            if (finishReason === 'MAX_TOKENS') {
-              logger.warn('Gemini alternative response reached max tokens limit', {
-                finishReason
-              });
-            }
-            
-            logger.info('Alternative request successful', {
-              responseLength: text.length,
-              statusCode: res.statusCode,
-              finishReason
-            });
-            
-            resolve(text.trim());
-          } catch (parseError) {
-            logger.error('Failed to parse alternative response', {
-              error: parseError.message,
-              rawResponse: data.substring(0, 500),
-              statusCode: res.statusCode
-            });
-            reject(new Error(`Failed to parse response: ${parseError.message}`));
-          }
-        });
-      });
-      
-      req.on('error', (error) => {
-        reject(new Error(`Alternative request failed: ${error.message}`));
-      });
-      
-      req.on('timeout', () => {
-        req.destroy();
-        reject(new Error('Alternative request timeout'));
-      });
-      
-      req.write(postData);
-      req.end();
-    });
   }
 }
 
