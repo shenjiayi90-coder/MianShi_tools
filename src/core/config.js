@@ -39,6 +39,49 @@ class ConfigManager {
       },
 
       llm: {
+        // Active provider. Kept as a switch so a Gemini backend can be
+        // reintroduced without touching the service layer.
+        provider: process.env.LLM_PROVIDER || 'deepseek',
+
+        // Natural language for explanations.
+        //   'auto' → mirror the language of the question (default)
+        //   'zh'   → always answer in Chinese, even if asked in English
+        // Distinct from the coding language, which only controls code fences.
+        responseLanguage: process.env.LLM_RESPONSE_LANGUAGE || 'auto',
+
+        deepseek: {
+          // `deepseek-flash` is the multimodal (text + image) model, which is
+          // what screenshot analysis requires.
+          model: process.env.DEEPSEEK_MODEL || 'deepseek-flash',
+          baseUrl: process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com/v1',
+          fallbackModels: [],
+          maxRetries: 3,
+          // Reasoning models think before answering, so a request that would
+          // take 4s without thinking can take 10s+ with it. 90s covers a long
+          // thinking answer on a slow connection without hanging the UI.
+          timeout: 90000,
+          fallbackEnabled: true,
+          generation: {
+            temperature: 0.7,
+            topP: 0.9,
+            // Reasoning tokens are billed against max_tokens, so this must be
+            // generous: with thinking on, a hard DSA answer can spend 2-3k
+            // tokens thinking before writing a single character of output.
+            maxOutputTokens: 8192
+          },
+          // 'none' | 'low' | 'high' | 'max'.
+          //   none → no chain-of-thought; fastest (~4s) — the default here
+          //   low  → balanced (~5s)
+          //   high → best answers (~8-10s, provider default)
+          // Thinking is disabled by default: in a live interview the answer is
+          // needed immediately, and reasoning tokens also consume the
+          // max_tokens budget (which can truncate or empty the visible answer).
+          // Raise it via Settings or DEEPSEEK_REASONING_EFFORT when a problem
+          // genuinely needs deeper analysis.
+          reasoningEffort: process.env.DEEPSEEK_REASONING_EFFORT || 'none'
+        },
+
+        // Retained for reference / future re-enable.
         gemini: {
           model: 'gemini-3.1-flash-lite',
           fallbackModels: ['gemini-2.5-flash-lite', 'gemini-3.5-flash'],
@@ -64,6 +107,18 @@ class ConfigManager {
           enableAudioLogging: false,
           outputFormat: 'detailed'
         },
+        // DashScope (Alibaba Bailian) cloud streaming ASR — Qwen / FunASR.
+        // Strongest option for Chinese and for Chinese/English code-switching,
+        // and far faster to first text than local Whisper.
+        dashscope: {
+          model: process.env.DASHSCOPE_ASR_MODEL || 'qwen-audio-3.0-asr-flash-streaming',
+          baseUrl: process.env.DASHSCOPE_WS_URL || 'wss://maas.qianwenaiapi.com/api-ws/v1/inference',
+          // Declaring both languages is what keeps English technical terms
+          // ("token bucket", "Redis") intact inside Chinese speech.
+          languageHints: process.env.DASHSCOPE_LANGUAGE_HINTS || 'zh,en',
+          // Drops filler words ("嗯", "那个") from the transcript.
+          disfluencyRemoval: false
+        },
         whisper: {
           model: 'small',
           language: 'auto',
@@ -87,7 +142,21 @@ class ConfigManager {
           preRollMs: 300,
           // Absolute RMS energy floor (normalized 0..1). Energy below this is
           // always treated as silence regardless of the adaptive noise floor.
-          vadEnergyFloor: 0.008
+          vadEnergyFloor: 0.008,
+          // The system-audio (loopback) channel carries the interviewer's voice
+          // straight from the call mix — louder and cleaner than a room mic, so
+          // it needs its own, lower floor.
+          systemVadEnergyFloor: 0.004,
+          // Capture system audio alongside the microphone so the interviewer's
+          // questions can be told apart from the candidate's own speech.
+          // Opt-in: needs an extra permission on macOS and is unavailable on Linux.
+          systemAudioEnabled: false,
+          // Who the app answers: 'interviewer' | 'me' | 'both'.
+          //   interviewer — only the other party's questions trigger an answer
+          //                 (their voice comes from the system-audio channel)
+          //   me          — only your own voice triggers an answer
+          //   both        — either one does
+          answerSource: 'interviewer'
         }
       },
 

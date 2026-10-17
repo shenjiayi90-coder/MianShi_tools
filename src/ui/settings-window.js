@@ -7,6 +7,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const closeButton = document.getElementById('closeButton');
     const quitButton = document.getElementById('quitButton');
     const speechProviderSelect = document.getElementById('speechProvider');
+    const dashscopeApiKeyInput = document.getElementById('dashscopeApiKey');
+    const dashscopeModelInput = document.getElementById('dashscopeModel');
+    const dashscopeLanguageHintsInput = document.getElementById('dashscopeLanguageHints');
     const azureKeyInput = document.getElementById('azureKey');
     const azureRegionInput = document.getElementById('azureRegion');
     const whisperCommandInput = document.getElementById('whisperCommand');
@@ -14,11 +17,15 @@ document.addEventListener('DOMContentLoaded', () => {
     const whisperLanguageInput = document.getElementById('whisperLanguage');
     const whisperDeviceSelect = document.getElementById('whisperDevice');
     const whisperCaptureModeSelect = document.getElementById('whisperCaptureMode');
+    const whisperSystemAudioSelect = document.getElementById('whisperSystemAudio');
+    const whisperAnswerSourceSelect = document.getElementById('whisperAnswerSource');
     const whisperResponseTargetSelect = document.getElementById('whisperResponseTarget');
     const whisperSegmentMsInput = document.getElementById('whisperSegmentMs');
     const geminiKeyInput = document.getElementById('geminiKey');
+    const reasoningEffortSelect = document.getElementById('reasoningEffort');
     const windowGapInput = document.getElementById('windowGap');
     const codingLanguageSelect = document.getElementById('codingLanguage');
+    const responseLanguageSelect = document.getElementById('responseLanguage');
     const activeSkillSelect = document.getElementById('activeSkill');
     const iconGrid = document.getElementById('iconGrid');
 
@@ -80,14 +87,20 @@ document.addEventListener('DOMContentLoaded', () => {
         // empty strings were skipped which left stale UI values.
         if (azureKeyInput) azureKeyInput.value = settings.azureKey || '';
         if (azureRegionInput) azureRegionInput.value = settings.azureRegion || '';
+        if (dashscopeApiKeyInput) dashscopeApiKeyInput.value = settings.dashscopeApiKey || '';
+        if (dashscopeModelInput) dashscopeModelInput.value = settings.dashscopeModel || '';
+        if (dashscopeLanguageHintsInput) dashscopeLanguageHintsInput.value = settings.dashscopeLanguageHints || '';
         if (whisperCommandInput) whisperCommandInput.value = settings.whisperCommand || '';
         if (whisperModelInput) whisperModelInput.value = settings.whisperModel || '';
         if (whisperLanguageInput) whisperLanguageInput.value = settings.whisperLanguage || '';
         if (whisperDeviceSelect) whisperDeviceSelect.value = settings.whisperDevice || 'auto';
         if (whisperCaptureModeSelect) whisperCaptureModeSelect.value = settings.whisperCaptureMode || 'vad';
+        if (whisperSystemAudioSelect) whisperSystemAudioSelect.value = settings.whisperSystemAudio ? 'true' : 'false';
+        if (whisperAnswerSourceSelect) whisperAnswerSourceSelect.value = settings.whisperAnswerSource || 'interviewer';
         if (whisperResponseTargetSelect) whisperResponseTargetSelect.value = settings.whisperResponseTarget || 'both';
         if (whisperSegmentMsInput) whisperSegmentMsInput.value = settings.whisperSegmentMs || '';
-        if (geminiKeyInput) geminiKeyInput.value = settings.geminiKey || '';
+        if (geminiKeyInput) geminiKeyInput.value = settings.deepseekKey || settings.geminiKey || '';
+        if (reasoningEffortSelect) reasoningEffortSelect.value = settings.llmReasoningEffort || 'none';
         if (windowGapInput) windowGapInput.value = settings.windowGap || '';
 
         // Set C++ as default if no coding language is specified
@@ -96,6 +109,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         if (settings.activeSkill && activeSkillSelect) activeSkillSelect.value = settings.activeSkill;
+        if (responseLanguageSelect) responseLanguageSelect.value = settings.responseLanguage || 'auto';
 
         // Handle icon selection
         const selectedIcon = settings.selectedIcon || settings.appIcon;
@@ -139,17 +153,24 @@ document.addEventListener('DOMContentLoaded', () => {
         if (speechProviderSelect) settings.speechProvider = speechProviderSelect.value;
         if (azureKeyInput) settings.azureKey = azureKeyInput.value;
         if (azureRegionInput) settings.azureRegion = azureRegionInput.value;
+        if (dashscopeApiKeyInput) settings.dashscopeApiKey = dashscopeApiKeyInput.value;
+        if (dashscopeModelInput) settings.dashscopeModel = dashscopeModelInput.value;
+        if (dashscopeLanguageHintsInput) settings.dashscopeLanguageHints = dashscopeLanguageHintsInput.value;
         if (whisperCommandInput) settings.whisperCommand = whisperCommandInput.value;
         if (whisperModelInput) settings.whisperModel = whisperModelInput.value;
         if (whisperLanguageInput) settings.whisperLanguage = whisperLanguageInput.value;
         if (whisperDeviceSelect) settings.whisperDevice = whisperDeviceSelect.value;
         if (whisperCaptureModeSelect) settings.whisperCaptureMode = whisperCaptureModeSelect.value;
+        if (whisperSystemAudioSelect) settings.whisperSystemAudio = whisperSystemAudioSelect.value === 'true';
+        if (whisperAnswerSourceSelect) settings.whisperAnswerSource = whisperAnswerSourceSelect.value;
         if (whisperResponseTargetSelect) settings.whisperResponseTarget = whisperResponseTargetSelect.value;
         if (whisperSegmentMsInput) settings.whisperSegmentMs = whisperSegmentMsInput.value;
-        if (geminiKeyInput) settings.geminiKey = geminiKeyInput.value;
+        if (geminiKeyInput) settings.deepseekKey = geminiKeyInput.value;
+        if (reasoningEffortSelect) settings.reasoningEffort = reasoningEffortSelect.value;
         if (windowGapInput) settings.windowGap = windowGapInput.value;
         if (codingLanguageSelect) settings.codingLanguage = codingLanguageSelect.value;
         if (activeSkillSelect) settings.activeSkill = activeSkillSelect.value;
+        if (responseLanguageSelect) settings.responseLanguage = responseLanguageSelect.value;
         
         window.api.send('save-settings', settings);
     };
@@ -163,6 +184,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const azureGroup = document.getElementById('azureFields');
         const whisperGroup = document.getElementById('whisperFields');
         const azureNote = document.getElementById('azureFieldsNote');
+        const dashscopeGroup = document.getElementById('dashscopeFields');
 
         if (azureGroup) {
             azureGroup.style.display = provider === 'azure' ? '' : 'none';
@@ -173,10 +195,16 @@ document.addEventListener('DOMContentLoaded', () => {
         if (azureNote) {
             azureNote.style.display = provider === 'azure' ? '' : 'none';
         }
+        if (dashscopeGroup) {
+            dashscopeGroup.style.display = provider === 'dashscope' ? '' : 'none';
+        }
 
         // Also toggle disabled attribute for any leftover direct field refs
         [azureKeyInput, azureRegionInput].forEach(input => {
             if (input) input.disabled = provider !== 'azure';
+        });
+        [dashscopeApiKeyInput, dashscopeModelInput, dashscopeLanguageHintsInput].forEach(input => {
+            if (input) input.disabled = provider !== 'dashscope';
         });
         [whisperCommandInput, whisperModelInput, whisperLanguageInput, whisperDeviceSelect,
             whisperCaptureModeSelect, whisperResponseTargetSelect, whisperSegmentMsInput].forEach(input => {
@@ -193,9 +221,12 @@ document.addEventListener('DOMContentLoaded', () => {
         whisperLanguageInput,
         whisperDeviceSelect,
         whisperCaptureModeSelect,
+        whisperSystemAudioSelect,
+        whisperAnswerSourceSelect,
         whisperResponseTargetSelect,
         whisperSegmentMsInput,
         geminiKeyInput,
+        reasoningEffortSelect,
         windowGapInput
     ];
 
@@ -233,6 +264,17 @@ document.addEventListener('DOMContentLoaded', () => {
             saveSettings();
             // Also update the main window
             window.api.send('update-skill', e.target.value);
+        });
+    }
+
+    // Answer-language handler: save immediately so the next question uses it.
+    if (responseLanguageSelect) {
+        responseLanguageSelect.addEventListener('change', (e) => {
+            if (window.electronAPI && window.electronAPI.saveSettings) {
+                window.electronAPI.saveSettings({ responseLanguage: e.target.value });
+            } else {
+                saveSettings();
+            }
         });
     }
 

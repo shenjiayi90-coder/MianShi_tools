@@ -78,6 +78,7 @@ app.commandLine.appendSwitch("no-pings");
 const logger = require("./src/core/logger").createServiceLogger("MAIN");
 const config = require("./src/core/config");
 const FirstRunManager = require("./src/core/first-run");
+const { EchoSuppressor } = require("./src/services/echo-suppressor");
 
 // ── Global crash guard ──
 // The speech path spawns external processes (Whisper CLI, and on macOS/Linux
@@ -126,9 +127,17 @@ class ApplicationController {
     this._utteranceDispatchInFlight = false;
     this._utteranceCoalesceMs = 800;
 
+    // Removes the duplicate transcript produced when the interviewer's voice
+    // is captured by both the loopback and the microphone (speakers, not
+    // headphones).
+    this._echoSuppressor = new EchoSuppressor({
+      windowMs: Number(process.env.ECHO_WINDOW_MS) || undefined,
+      threshold: Number(process.env.ECHO_SIMILARITY_THRESHOLD) || undefined
+    });
+
     // First-run onboarding: detects missing .env / API key and triggers
     // a settings-window prompt on first launch so users don't have to
-    // dig through docs to figure out they need a Gemini API key.
+    // dig through docs to figure out they need a DeepSeek API key.
     this.firstRunManager = new FirstRunManager({
       logger: logger,
       // .env and the sentinel both live in userData so they survive cwd
@@ -308,10 +317,10 @@ class ApplicationController {
   setupNetworkConfiguration() {
     // Configure session to handle network requests better
     const ses = session.defaultSession;
-    
-    // Allow HTTPS requests to Google APIs
+
+    // Allow HTTPS requests to the DeepSeek API
     ses.webRequest.onBeforeSendHeaders((details, callback) => {
-      if (details.url.includes('generativelanguage.googleapis.com')) {
+      if (details.url.includes('api.deepseek.com')) {
         const platformUA = process.platform === 'darwin'
           ? 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.156 Safari/537.36'
           : 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.156 Safari/537.36';
@@ -319,17 +328,17 @@ class ApplicationController {
       }
       callback({ requestHeaders: details.requestHeaders });
     });
-    
-    // Handle certificate errors for Google APIs
+
+    // Handle certificate errors for the DeepSeek API
     ses.setCertificateVerifyProc((request, callback) => {
-      if (request.hostname === 'generativelanguage.googleapis.com') {
-        callback(0); // Trust Google's certificates
+      if (request.hostname === 'api.deepseek.com') {
+        callback(0); // Trust DeepSeek's certificates
       } else {
         callback(-2); // Use default verification
       }
     });
-    
-    logger.debug('Network configuration applied for Gemini API');
+
+    logger.debug('Network configuration applied for DeepSeek API');
   }
 
   setupPermissions() {
@@ -386,9 +395,138 @@ class ApplicationController {
         callback(granted);
       }
     );
+
+    this.setupDisplayMediaHandler(appSession, isTrustedAppContents);
+  }
+
+  /**
+   * Implement `getDisplayMedia` for the renderer.
+   *
+   * Electron does NOT ship a default implementation: unlike Chrome, it never
+   * shows a screen/window picker, and a call with no handler registered fails
+   * immediately with `NotSupportedError: Not supported`. That is why system
+   * audio capture could never work — the renderer asked, got an instant
+   * rejection, and the app fell back to microphone-only, making every
+   * interviewer line look like the candidate's own speech.
+   *
+   * The handler picks the screen Electron considers primary and, critically,
+   * forwards `loopback` audio. On Windows `loopback` captures whatever the
+   * default output device is playing — exactly the interviewer's voice.
+   *
+   * @param {Electron.Session} appSession
+   * @param {(wc: Electron.WebContents) => boolean} isTrusted
+   */
+  setupDisplayMediaHandler(appSession, isTrusted) {
+    try {
+      appSession.setDisplayMediaRequestHandler(async (request, callback) => {
+        // Only serve our own windows; a renderer that is not part of the app
+        // must never be handed a screen stream.
+        //
+        // `request.frame` is not always populated (it can be undefined or lack
+        // webContents depending on the Electron build), and rejecting on that
+        // produced a hard AbortError. Fall back to Electron's own list of
+        // app windows, which is just as safe: anything not in it is not ours.
+        const frameContents = request && request.frame && request.frame.webContents;
+        let trusted = false;
+        if (frameContents) {
+          trusted = isTrustedAppContents(frameContents);
+        } else {
+          try {
+            const { BrowserWindow, webContents } = require("electron");
+            const ourIds = new Set(
+              BrowserWindow.getAllWindows()
+                .filter((w) => !w.isDestroyed())
+                .map((w) => w.webContents.id)
+            );
+            // A request arriving with no frame identity can only have come from
+            // a live window of ours; Electron does not accept it otherwise.
+            trusted = ourIds.size > 0 && (
+              webContents.getAllWebContents().some((wc) => ourIds.has(wc.id))
+            );
+          } catch (_) {
+            trusted = false;
+          }
+        }
+
+        if (!trusted) {
+          logger.warn("Denied display-media request from an untrusted frame", {
+            hadFrame: !!frameContents
+          });
+          callback({});
+          return;
+        }
+
+        try {
+          const { desktopCapturer, screen } = require("electron");
+          const primary = screen.getPrimaryDisplay();
+          const sources = await desktopCapturer.getSources({
+            types: ["screen"],
+            thumbnailSize: { width: 1, height: 1 }
+          });
+
+          if (!sources || sources.length === 0) {
+            logger.warn("No screen source available for display-media request");
+            callback({});
+            return;
+          }
+
+          // Match the primary display to its capture source; fall back to the
+          // first screen so a naming mismatch never breaks audio capture.
+          const target = sources.find((s) => String(s.display_id) === String(primary.id)) || sources[0];
+
+          logger.info("Granting display-media request with loopback audio", {
+            sourceName: target.name,
+            sourceId: target.id,
+            audio: "loopback"
+          });
+
+          callback({
+            video: target,
+            // `loopback` is what surfaces the system mix as an audio track on
+            // Windows. Without it getDisplayMedia resolves with video only and
+            // the interviewer channel stays silent.
+            audio: process.platform === "win32" ? "loopback" : undefined
+          });
+        } catch (error) {
+          logger.error("Display-media handler failed", { error: error.message });
+          callback({});
+        }
+      });
+
+      logger.info("Display-media handler registered", {
+        platform: process.platform,
+        loopbackAudio: process.platform === "win32"
+      });
+    } catch (error) {
+      // Older Electron builds lack this API; the app still works, just without
+      // the interviewer channel.
+      logger.warn("Could not register display-media handler", { error: error.message });
+    }
   }
 
   setupGlobalShortcuts() {
+    return this.registerGlobalShortcuts();
+  }
+
+  /**
+   * Register global shortcuts, tracking which ones actually took effect.
+   *
+   * `globalShortcut.register` returns false when another application already
+   * owns the combination — GeForce Experience claims Alt+R, for example. That
+   * failure used to be logged at debug level and therefore invisible, leaving
+   * the user pressing a key that silently did nothing.
+   *
+   * Failing shortcuts are recorded in `this.shortcutStatus` so the UI can warn,
+   * and the speech toggle falls back to the first free alternative.
+   */
+  registerGlobalShortcuts() {
+    const speechHandler = () => this.toggleSpeechRecognition();
+
+    // The primary speech key, then alternates that avoid the combinations
+    // commonly taken by GPU/recording overlays (GeForce Experience, Xbox Game
+    // Bar, OBS). The first one that registers wins.
+    const speechCandidates = this._getSpeechShortcutCandidates();
+
     const shortcuts = {
       "CommandOrControl+Shift+S": () => this.triggerScreenshotOCR(),
       "CommandOrControl+Shift+V": () => windowManager.toggleVisibility(),
@@ -397,7 +535,6 @@ class ApplicationController {
       "CommandOrControl+Shift+\\": () => this.clearSessionMemory(),
       "CommandOrControl+,": () => windowManager.showSettings(),
       "Alt+A": () => windowManager.toggleInteraction(),
-      "Alt+R": () => this.toggleSpeechRecognition(),
       "CommandOrControl+Shift+T": () => windowManager.forceAlwaysOnTopForAllWindows(),
       "CommandOrControl+Shift+Alt+T": () => {
         const results = windowManager.testAlwaysOnTopForAllWindows();
@@ -410,14 +547,101 @@ class ApplicationController {
       "CommandOrControl+Right": () => this.handleRightArrow(),
     };
 
+    this.shortcutStatus = { registered: {}, failed: [], speechShortcut: null };
+
     Object.entries(shortcuts).forEach(([accelerator, handler]) => {
       const success = globalShortcut.register(accelerator, handler);
-      logger.debug("Global shortcut registered", { accelerator, success });
+      this.shortcutStatus.registered[accelerator] = success;
+      if (success) {
+        logger.debug("Global shortcut registered", { accelerator });
+      } else {
+        this.shortcutStatus.failed.push(accelerator);
+        logger.warn("Global shortcut could not be registered (already taken by another app)", {
+          accelerator
+        });
+      }
     });
+
+    // Speech toggle: try candidates until one binds.
+    // `takenSpeechKeys` records the ones that lost, so the UI can explain why
+    // the documented Alt+R is not the key that ended up working.
+    this.shortcutStatus.takenSpeechKeys = [];
+    for (const accelerator of speechCandidates) {
+      if (globalShortcut.register(accelerator, speechHandler)) {
+        this.shortcutStatus.speechShortcut = accelerator;
+        this.shortcutStatus.registered[accelerator] = true;
+        logger.info("Speech shortcut registered", { accelerator });
+        break;
+      }
+      this.shortcutStatus.registered[accelerator] = false;
+      this.shortcutStatus.takenSpeechKeys.push(accelerator);
+      logger.warn("Speech shortcut unavailable, trying next candidate", { accelerator });
+    }
+
+    if (!this.shortcutStatus.speechShortcut) {
+      this.shortcutStatus.failed.push(...speechCandidates);
+      logger.error("No speech shortcut could be registered — use the microphone button instead", {
+        tried: speechCandidates
+      });
+    }
+
+    // Tell every window which keys are live so the UI can show the real one.
+    this.broadcastShortcutStatus();
+    return this.shortcutStatus;
+  }
+
+  /**
+   * Speech-toggle key candidates, most-preferred first.
+   *
+   * `Alt+R` is the documented default but is taken by GeForce Experience's
+   * instant-replay overlay on many gaming laptops, so we fall through to
+   * combinations that no common overlay claims.
+   */
+  _getSpeechShortcutCandidates() {
+    const configured = String(process.env.SPEECH_SHORTCUT || '').trim();
+    const defaults = [
+      "Alt+R",              // documented default
+      "CommandOrControl+Shift+R",
+      "CommandOrControl+Alt+R",
+      "Alt+Shift+R",
+      "CommandOrControl+Shift+Space"
+    ];
+    if (configured && !defaults.includes(configured)) {
+      return [configured, ...defaults];
+    }
+    return defaults;
+  }
+
+  /** Push the effective shortcut map to the renderers. */
+  broadcastShortcutStatus() {
+    const payload = {
+      speech: this.shortcutStatus ? this.shortcutStatus.speechShortcut : null,
+      speechLabel: this.getSpeechShortcutLabel(),
+      failed: this.shortcutStatus ? this.shortcutStatus.failed : [],
+      takenSpeechKeys: this.shortcutStatus ? (this.shortcutStatus.takenSpeechKeys || []) : [],
+      registered: this.shortcutStatus ? this.shortcutStatus.registered : {}
+    };
+    BrowserWindow.getAllWindows().forEach((win) => {
+      if (!win.isDestroyed()) {
+        win.webContents.send("shortcut-status", payload);
+      }
+    });
+  }
+
+  /** Human-readable label for the active speech shortcut, e.g. "Ctrl+Shift+R". */
+  getSpeechShortcutLabel() {
+    const accel = this.shortcutStatus && this.shortcutStatus.speechShortcut;
+    if (!accel) return null;
+    return accel
+      .replace("CommandOrControl", process.platform === "darwin" ? "Cmd" : "Ctrl")
+      .replace("Command", "Cmd");
   }
 
   setupServiceEventHandlers() {
     speechService.on("recording-started", () => {
+      // A new session starts with a clean echo history: matches from the last
+      // session must not suppress the first words of this one.
+      if (this._echoSuppressor) this._echoSuppressor.reset();
       windowManager.handleRecordingStarted();
     });
 
@@ -425,8 +649,8 @@ class ApplicationController {
       windowManager.handleRecordingStopped();
     });
 
-    speechService.on("transcription", (text) => {
-      this.handleTranscriptionFragment(text);
+    speechService.on("transcription", (text, meta) => {
+      this.handleTranscriptionFragment(text, meta);
     });
 
     speechService.on("interim-transcription", (text) => {
@@ -476,6 +700,19 @@ class ApplicationController {
       return speechService.isAvailable ? speechService.isAvailable() : false;
     });
 
+    // Which global shortcuts actually bound, and which were taken by another
+    // app. The renderer shows the real speech key instead of the documented
+    // default (Alt+R is often owned by GeForce Experience).
+    ipcMain.handle("get-shortcut-status", () => {
+      return {
+        speech: this.shortcutStatus ? this.shortcutStatus.speechShortcut : null,
+        speechLabel: this.getSpeechShortcutLabel(),
+        failed: this.shortcutStatus ? this.shortcutStatus.failed : [],
+        takenSpeechKeys: this.shortcutStatus ? (this.shortcutStatus.takenSpeechKeys || []) : [],
+        registered: this.shortcutStatus ? this.shortcutStatus.registered : {}
+      };
+    });
+
     ipcMain.handle("start-speech-recognition", () => {
       speechService.startRecording();
       return speechService.getStatus();
@@ -486,11 +723,23 @@ class ApplicationController {
       return speechService.getStatus();
     });
 
-    // Raw PCM audio captured by the renderer's Web Audio API (Windows Whisper path)
+    // Raw PCM audio captured by the renderer's Web Audio API (Windows Whisper path).
+    // `channel` distinguishes the microphone ('mic' — the candidate) from the
+    // system-audio loopback ('system' — the interviewer).
     ipcMain.on("audio-chunk", (_event, data) => {
       if (data && data.buffer) {
-        speechService.handleAudioChunkFromRenderer(Buffer.from(data.buffer));
+        speechService.handleAudioChunkFromRenderer(
+          Buffer.from(data.buffer),
+          data.channel || "mic"
+        );
       }
+    });
+
+    // The renderer could not start system-audio capture (permission denied,
+    // user cancelled the picker, or the platform does not support it). Turn the
+    // channel off so nothing waits on audio that will never arrive.
+    ipcMain.on("system-audio-unavailable", () => {
+      speechService.disableSystemAudioChannel("renderer could not capture system audio");
     });
 
     // Also handle direct send events for fallback
@@ -652,6 +901,17 @@ class ApplicationController {
       }
     });
 
+    ipcMain.handle("set-deepseek-api-key", (event, apiKey) => {
+      llmService.updateApiKey(apiKey);
+      return llmService.getStats();
+    });
+
+    ipcMain.handle("get-llm-status", () => {
+      return llmService.getStats();
+    });
+
+    // Backwards-compatible aliases: the preload bridge and the settings /
+    // onboarding renderers were written against the old Gemini channel names.
     ipcMain.handle("set-gemini-api-key", (event, apiKey) => {
       llmService.updateApiKey(apiKey);
       return llmService.getStats();
@@ -688,6 +948,10 @@ class ApplicationController {
     });
 
     ipcMain.handle("test-gemini-connection", async () => {
+      return await llmService.testConnection();
+    });
+
+    ipcMain.handle("test-llm-connection", async () => {
       return await llmService.testConnection();
     });
 
@@ -1226,16 +1490,95 @@ class ApplicationController {
    * are shown in the UI immediately so speech feels live, but the LLM is only
    * asked once the speaker has actually paused — this is what stops one spoken
    * line from producing two separate, slow answers.
+   *
+   * `meta.speaker` says who talked: 'interviewer' (system audio) or 'me' (mic).
+   * Only the configured answer source reaches the LLM, so the candidate's own
+   * words never trigger an answer to their own sentence. Everything is still
+   * recorded in the session so the model has full conversational context.
    */
-  handleTranscriptionFragment(text) {
+  handleTranscriptionFragment(text, meta = {}) {
     const fragment = (text || "").trim();
     if (!fragment) {
       return;
     }
 
-    // Route speech UI events according to the user's response-target setting.
-    sessionManager.addUserInput(fragment, 'speech');
-    this.sendToVoiceResponseWindows("transcription-received", { text: fragment });
+    const speaker = meta.speaker === "interviewer" ? "interviewer" : "me";
+    const channelId = meta.channel || (speaker === "interviewer" ? "system" : "mic");
+
+    // ── Acoustic echo handling ──
+    //
+    // On speakers the interviewer's voice is captured twice: digitally by the
+    // loopback channel, and again through the air by the microphone. Both
+    // transcribe the same sentence, so it would otherwise show as both
+    // [面试官] and [我].
+    //
+    // The loopback channel is authoritative (it is the call's own mix, with no
+    // room acoustics), so the microphone copy is dropped — and, importantly,
+    // this is decided by CHANNEL, not by arrival order. Measured in the app the
+    // microphone usually reports first, so a naive first-wins rule would keep
+    // the echo and discard the interviewer's line, inverting every label.
+    const isAuthoritative = channelId === "system";
+    const echo = this._echoSuppressor.check(channelId, fragment);
+
+    if (echo.isEcho && !isAuthoritative) {
+      logger.info("Dropped cross-channel echo", {
+        channel: channelId,
+        speaker,
+        score: Number((echo.score || 0).toFixed(2)),
+        text: fragment.slice(0, 120),
+        matched: String(echo.matchedText || "").slice(0, 120)
+      });
+      return;
+    }
+
+    if (isAuthoritative && echo.duplicateOfOtherChannel) {
+      // The microphone already emitted this sentence moments ago because it won
+      // the race. Retract that bubble so the line does not appear twice, and
+      // let the authoritative (interviewer) copy take its place.
+      logger.info("Replacing earlier duplicate with the authoritative line", {
+        score: Number((echo.score || 0).toFixed(2)),
+        text: fragment.slice(0, 120)
+      });
+      this.retractDuplicateTranscript(echo.matchedText);
+    }
+
+    this._echoSuppressor.record(channelId, fragment);
+
+    const shouldAnswer = speechService.shouldAnswerSpeaker
+      ? speechService.shouldAnswerSpeaker(speaker)
+      : true;
+
+    logger.info("Speech fragment received", {
+      speaker,
+      channel: channelId,
+      shouldAnswer,
+      effectiveAnswerSource: speechService.getEffectiveAnswerSource
+        ? speechService.getEffectiveAnswerSource()
+        : null,
+      text: fragment.slice(0, 200)
+    });
+
+    // Tag the text so both the UI and the LLM can tell the two apart.
+    const labelled = speaker === "interviewer"
+      ? `[面试官] ${fragment}`
+      : `[我] ${fragment}`;
+
+    sessionManager.addUserInput(labelled, "speech");
+    this.sendToVoiceResponseWindows("transcription-received", {
+      text: labelled,
+      speaker,
+      channel: channelId
+    });
+
+    if (!shouldAnswer) {
+      // Context only. The candidate's own speech (or the interviewer's, when
+      // answering the mic) is remembered but must not trigger a request.
+      logger.debug("Speech kept as context without triggering an answer", {
+        speaker,
+        textLength: fragment.length
+      });
+      return;
+    }
 
     this._utteranceBuffer = this._utteranceBuffer
       ? `${this._utteranceBuffer} ${fragment}`
@@ -1264,6 +1607,36 @@ class ApplicationController {
    * running, leave the buffer intact and let that dispatch's completion pick it
    * up — so we never pile up overlapping requests for the same person talking.
    */
+  /**
+   * Remove a transcript bubble that turned out to be an acoustic echo.
+   *
+   * The microphone usually wins the race against the loopback channel, so the
+   * duplicate is already on screen by the time the authoritative copy arrives.
+   * Rather than leave both, the earlier bubble (and its session-memory entry)
+   * is withdrawn.
+   *
+   * @param {string} matchedText the earlier, non-authoritative transcript
+   */
+  retractDuplicateTranscript(matchedText) {
+    const target = String(matchedText || "").trim();
+    if (!target) return;
+
+    // Drop the matching session-memory entry when the manager supports it, so
+    // the LLM's context does not carry the echo either.
+    try {
+      if (typeof sessionManager.removeLastUserInputMatching === "function") {
+        sessionManager.removeLastUserInputMatching(target);
+      }
+    } catch (error) {
+      logger.debug("Could not remove retracted transcript from session memory", {
+        error: error.message
+      });
+    }
+
+    this.sendToVoiceResponseWindows("transcription-retracted", { text: target });
+    logger.info("Retracted duplicate transcript", { text: target.slice(0, 120) });
+  }
+
   async dispatchCoalescedUtterance() {
     if (this._utteranceDispatchInFlight) {
       return;
@@ -1276,6 +1649,18 @@ class ApplicationController {
     this._utteranceDispatchInFlight = true;
 
     try {
+      // Tell the LLM who it is answering. Without this the prompt would keep
+      // applying "stay silent on your own words" even after the app fell back
+      // to the microphone — where the user's own words ARE the questions —
+      // and every reply would be a bare "OK".
+      if (llmService.setAnsweredSpeaker) {
+        llmService.setAnsweredSpeaker(
+          speechService.getEffectiveAnswerSource
+            ? speechService.getEffectiveAnswerSource()
+            : "me"
+        );
+      }
+
       const sessionHistory = sessionManager.getOptimizedHistory();
       await this.processTranscriptionWithLLM(combined, sessionHistory);
     } catch (error) {
@@ -1606,9 +1991,27 @@ class ApplicationController {
         (process.env.WHISPER_MANUAL_CAPTURE === "true" ? "manual" : "vad"),
       whisperResponseTarget: process.env.WHISPER_RESPONSE_TARGET || "both",
       whisperSegmentMs: process.env.WHISPER_SEGMENT_MS || "4000",
-      geminiKey: process.env.GEMINI_API_KEY || "",
+      deepseekKey: process.env.DEEPSEEK_API_KEY || "",
+      // Kept so an older renderer that still reads `geminiKey` keeps working.
+      geminiKey: process.env.DEEPSEEK_API_KEY || "",
+      llmProvider: config.get("llm.provider") || "deepseek",
+      llmModel: config.get("llm.deepseek.model") || "deepseek-flash",
+      llmReasoningEffort: config.get("llm.deepseek.reasoningEffort") || "none",
+      responseLanguage: config.get("llm.responseLanguage") || "auto",
+
+      // Dual-channel speech: capture system audio so the interviewer's voice is
+      // separable from the candidate's, and choose who the app answers.
+      whisperSystemAudio: speechService._isSystemAudioEnabled
+        ? speechService._isSystemAudioEnabled()
+        : false,
+      whisperAnswerSource: speechService._getAnswerSource
+        ? speechService._getAnswerSource()
+        : "interviewer",
 
       azureConfigured: !!process.env.AZURE_SPEECH_KEY && !!process.env.AZURE_SPEECH_REGION,
+      dashscopeApiKey: process.env.DASHSCOPE_API_KEY || "",
+      dashscopeModel: config.get("speech.dashscope.model") || "qwen-audio-3.0-asr-flash-streaming",
+      dashscopeLanguageHints: (config.get("speech.dashscope.languageHints") || "zh,en"),
       speechAvailable: this.speechAvailable
     };
   }
@@ -1654,6 +2057,16 @@ class ApplicationController {
       if (settings.azureRegion !== undefined) {
         envUpdates.AZURE_SPEECH_REGION = settings.azureRegion;
       }
+      // DashScope (Alibaba Bailian) cloud ASR
+      if (settings.dashscopeApiKey !== undefined) {
+        envUpdates.DASHSCOPE_API_KEY = settings.dashscopeApiKey;
+      }
+      if (settings.dashscopeModel !== undefined) {
+        envUpdates.DASHSCOPE_ASR_MODEL = settings.dashscopeModel;
+      }
+      if (settings.dashscopeLanguageHints !== undefined) {
+        envUpdates.DASHSCOPE_LANGUAGE_HINTS = settings.dashscopeLanguageHints;
+      }
       if (settings.whisperCommand !== undefined) {
         envUpdates.WHISPER_COMMAND = settings.whisperCommand;
       }
@@ -1675,8 +2088,33 @@ class ApplicationController {
       if (settings.whisperSegmentMs !== undefined) {
         envUpdates.WHISPER_SEGMENT_MS = String(settings.whisperSegmentMs);
       }
-      if (settings.geminiKey !== undefined) {
-        envUpdates.GEMINI_API_KEY = settings.geminiKey;
+      // Dual-channel speech settings.
+      if (settings.whisperSystemAudio !== undefined) {
+        envUpdates.WHISPER_SYSTEM_AUDIO = settings.whisperSystemAudio ? "true" : "false";
+      }
+      if (["interviewer", "me", "both"].includes(settings.whisperAnswerSource)) {
+        envUpdates.WHISPER_ANSWER_SOURCE = settings.whisperAnswerSource;
+      }
+      // Accept either the new `deepseekKey` field or the legacy `geminiKey`
+      // name so old and new renderers both persist correctly.
+      const submittedKey = settings.deepseekKey !== undefined
+        ? settings.deepseekKey
+        : settings.geminiKey;
+      if (submittedKey !== undefined) {
+        envUpdates.DEEPSEEK_API_KEY = submittedKey;
+      }
+      // Reasoning effort is a live config value, not just an .env entry: apply
+      // it to the running config so the next request uses it without a restart.
+      if (["none", "low", "high", "max"].includes(settings.reasoningEffort)) {
+        envUpdates.DEEPSEEK_REASONING_EFFORT = settings.reasoningEffort;
+        config.set("llm.deepseek.reasoningEffort", settings.reasoningEffort);
+      }
+      // Answer language: same live-apply treatment so switching to Chinese
+      // takes effect on the very next question.
+      if (typeof settings.responseLanguage === "string" && settings.responseLanguage.trim()) {
+        const lang = settings.responseLanguage.trim();
+        envUpdates.LLM_RESPONSE_LANGUAGE = lang;
+        config.set("llm.responseLanguage", lang);
       }
 
       // Capture the previous whisper command BEFORE persisting — persistEnvUpdates
@@ -1685,19 +2123,44 @@ class ApplicationController {
       // bug the re-init guards against).
       const prevWhisperCommand = process.env.WHISPER_COMMAND || '';
 
+      // Push the speech-related values into the running speech service.
+      // `updateSettings` was never called anywhere, so live edits in the
+      // Settings window (capture mode, device, system audio, answer source)
+      // were persisted to .env but ignored until an app restart.
+      const speechSettings = {};
+      for (const key of [
+        "speechProvider", "azureKey", "azureRegion", "whisperCommand",
+        "whisperModelDir", "whisperModel", "whisperLanguage", "whisperCaptureMode",
+        "whisperDevice", "whisperSegmentMs", "whisperResponseTarget",
+        "whisperSystemAudio", "whisperAnswerSource",
+        "dashscopeApiKey", "dashscopeModel", "dashscopeBaseUrl", "dashscopeLanguageHints"
+      ]) {
+        if (settings[key] !== undefined) speechSettings[key] = settings[key];
+      }
+      if (Object.keys(speechSettings).length > 0) {
+        try {
+          speechService.updateSettings(speechSettings);
+          logger.info("Speech service updated with new settings", {
+            keys: Object.keys(speechSettings)
+          });
+        } catch (e) {
+          logger.warn("Failed to apply speech settings", { error: e.message });
+        }
+      }
+
       const persistedKeys = this.persistEnvUpdates(envUpdates);
 
-      // If the Gemini key was just saved, reinitialize the LLM service
+      // If the DeepSeek key was just saved, reinitialize the LLM service
       // so the new client picks up the key. Without this, the test-
       // connection button in the onboarding wizard fails with
       // "Service not initialized" because the client was first created
       // at app startup, before any key was set.
-      if (settings.geminiKey !== undefined && envUpdates.GEMINI_API_KEY !== undefined) {
+      if (submittedKey !== undefined) {
         try {
           llmService.initializeClient();
-          logger.info("LLM service reinitialized after Gemini key update");
+          logger.info("LLM service reinitialized after DeepSeek key update");
         } catch (e) {
-          logger.warn("Failed to reinitialize LLM service after Gemini key update", {
+          logger.warn("Failed to reinitialize LLM service after DeepSeek key update", {
             error: e.message
           });
         }

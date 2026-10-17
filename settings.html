@@ -313,6 +313,24 @@
                     </div>
                     <div class="settings-item">
                         <div>
+                            <div class="settings-item-label">Answer Language</div>
+                            <div class="settings-item-description">Language for explanations. Separate from the coding language above.</div>
+                        </div>
+                        <select class="input-field" id="responseLanguage">
+                            <option value="auto">Auto (match the question)</option>
+                            <option value="zh">简体中文</option>
+                            <option value="zh-tw">繁體中文</option>
+                            <option value="en">English</option>
+                            <option value="ja">日本語</option>
+                            <option value="ko">한국어</option>
+                            <option value="es">Español</option>
+                            <option value="fr">Français</option>
+                            <option value="de">Deutsch</option>
+                            <option value="ru">Русский</option>
+                        </select>
+                    </div>
+                    <div class="settings-item">
+                        <div>
                             <div class="settings-item-label">Active Skill</div>
                             <div class="settings-item-description">Choose your current focus area</div>
                         </div>
@@ -358,9 +376,44 @@
                             <div class="settings-item-description">Choose Azure Speech or a local OpenAI Whisper CLI</div>
                         </div>
                         <select class="input-field" id="speechProvider">
+                            <option value="dashscope">阿里云百炼（推荐，中文最准）</option>
+                            <option value="whisper">Local Whisper（离线免费）</option>
                             <option value="azure">Azure Speech</option>
-                            <option value="whisper">Local Whisper</option>
                         </select>
+                    </div>
+
+                    <!-- DashScope fields (shown only when DashScope is selected) -->
+                    <div id="dashscopeFields" class="settings-group">
+                        <div class="settings-item">
+                            <div>
+                                <div class="settings-item-label">百炼 API Key</div>
+                                <div class="settings-item-description">
+                                    阿里云百炼（DashScope）API Key，从
+                                    <a href="https://bailian.console.aliyun.com/" target="_blank" rel="noreferrer">bailian.console.aliyun.com</a>
+                                    获取
+                                </div>
+                            </div>
+                            <input type="password" class="input-field" id="dashscopeApiKey" placeholder="sk-...">
+                        </div>
+                        <div class="settings-item">
+                            <div>
+                                <div class="settings-item-label">识别模型</div>
+                                <div class="settings-item-description">推荐 qwen-audio-3.0-asr-flash-streaming（中文与中英混说最准）</div>
+                            </div>
+                            <input type="text" class="input-field" id="dashscopeModel" placeholder="qwen-audio-3.0-asr-flash-streaming">
+                        </div>
+                        <div class="settings-item">
+                            <div>
+                                <div class="settings-item-label">语言提示</div>
+                                <div class="settings-item-description">
+                                    逗号分隔。填 <code>zh,en</code> 可保留中文里的英文术语（Redis、token bucket），不填则自动检测
+                                </div>
+                            </div>
+                            <input type="text" class="input-field" id="dashscopeLanguageHints" placeholder="zh,en">
+                        </div>
+                        <div class="settings-note">
+                            云端识别：首包延迟约 250ms，需要联网。说话人分离由双通道实现（见下方「Also Listen to System Audio」）。
+                        </div>
                     </div>
 
                     <!-- Azure fields (shown only when Azure is selected) -->
@@ -429,6 +482,32 @@
                         </div>
                         <div class="settings-item">
                             <div>
+                                <div class="settings-item-label">Also Listen to System Audio</div>
+                                <div class="settings-item-description">
+                                    Captures the call's audio so the interviewer's questions are separated
+                                    from your own voice. You'll be asked to share a screen with audio.
+                                </div>
+                            </div>
+                            <select class="input-field" id="whisperSystemAudio">
+                                <option value="false">Off — microphone only</option>
+                                <option value="true">On — separate interviewer and me</option>
+                            </select>
+                        </div>
+                        <div class="settings-item">
+                            <div>
+                                <div class="settings-item-label">Answer Whose Voice</div>
+                                <div class="settings-item-description">
+                                    Which speaker should trigger an answer. Others are still remembered as context.
+                                </div>
+                            </div>
+                            <select class="input-field" id="whisperAnswerSource">
+                                <option value="interviewer">Interviewer only</option>
+                                <option value="me">Me only</option>
+                                <option value="both">Both</option>
+                            </select>
+                        </div>
+                        <div class="settings-item">
+                            <div>
                                 <div class="settings-item-label">Voice Response Target</div>
                                 <div class="settings-item-description">Choose where answers generated from speech are displayed</div>
                             </div>
@@ -459,15 +538,27 @@
             <div class="settings-section">
                 <div class="settings-section-title">
                     <i class="fas fa-robot"></i>
-                    Gemini Settings
+                    DeepSeek Settings
                 </div>
                 <div class="settings-section-content">
                     <div class="settings-item">
                         <div>
-                            <div class="settings-item-label">Google API Key</div>
-                            <div class="settings-item-description">Your Google API key for Gemini models</div>
+                            <div class="settings-item-label">DeepSeek API Key</div>
+                            <div class="settings-item-description">Your API key from platform.deepseek.com</div>
                         </div>
-                        <input type="password" class="input-field" id="geminiKey" placeholder="Enter your Google API key">
+                        <input type="password" class="input-field" id="geminiKey" placeholder="sk-...">
+                    </div>
+                    <div class="settings-item">
+                        <div>
+                            <div class="settings-item-label">Reasoning Effort</div>
+                            <div class="settings-item-description">Thinking is off by default for the fastest answers. Raise it only if a problem needs deeper analysis.</div>
+                        </div>
+                        <select class="input-field" id="reasoningEffort">
+                            <option value="none">none (fastest)</option>
+                            <option value="low">low (balanced)</option>
+                            <option value="high">high (smartest)</option>
+                            <option value="max">max (slowest)</option>
+                        </select>
                     </div>
                 </div>
             </div>

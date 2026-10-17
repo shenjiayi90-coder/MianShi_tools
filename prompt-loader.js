@@ -141,19 +141,25 @@ STRICT REQUIREMENTS:
   }
 
   /**
-   * Prepare Gemini API request with model memory or regular message
+   * Prepare an API request with model memory or regular message.
+   *
+   * NOTE: the returned object uses the internal Gemini-shaped request format
+   * that src/services/deepseek.adapter.js converts at the transport boundary.
+   * The `model` field here is a placeholder — the active model comes from
+   * config (`llm.deepseek.model`), not from this value.
+   *
    * @param {string} skillName - The active skill
    * @param {string} userMessage - The user's message/query
    * @param {Array} storedMemory - Current stored memory
    * @param {string|null} programmingLanguage - Optional programming language
-   * @returns {Object} Gemini API request configuration
+   * @returns {Object} API request configuration
    */
   prepareGeminiRequest(skillName, userMessage, storedMemory, programmingLanguage = null) {
     const normalizedSkillName = this.normalizeSkillName(skillName);
     const skillPrompt = this.getSkillPrompt(normalizedSkillName, programmingLanguage);
     
     const requestConfig = {
-      model: 'gemini-pro', // or your preferred Gemini model
+      model: null, // resolved from config by the LLM service
       contents: [],
       systemInstruction: null,
       generationConfig: {

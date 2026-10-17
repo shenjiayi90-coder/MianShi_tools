@@ -6,7 +6,7 @@
  * everything via the electronAPI bridge exposed by preload.js:
  *
  *   1. Welcome
- *   2. Gemini API key entry + live connection test
+ *   2. DeepSeek API key entry + live connection test
  *   3. Speech provider choice (Whisper / Azure / Skip)
  *   4. Whisper detect + (optional) install — only shown when whisper
  *   5. Star-the-repo prompt + summary
@@ -451,7 +451,7 @@
   function populateSummary() {
     const rows = [];
     rows.push({
-      label: '<i class="fas fa-key"></i> Gemini API',
+      label: '<i class="fas fa-key"></i> DeepSeek API',
       value: (state.geminiKey || state.geminiConfigured) ? 'Configured' : 'Missing',
       cls: (state.geminiKey || state.geminiConfigured) ? 'ok' : 'skip',
     });
@@ -514,7 +514,7 @@
     const name = currentScreenName();
     if (!canAdvance()) {
       // Lightly nudge the user
-      if (name === 'apikey') setKeyStatus('error', 'Enter a Gemini API key');
+      if (name === 'apikey') setKeyStatus('error', 'Enter a DeepSeek API key');
       return;
     }
 
@@ -655,7 +655,7 @@
   // ── Boot ──────────────────────────────────────────────────────────
   showScreen('welcome');
 
-  // Pre-populate Gemini key from existing .env (if any) so users with
+  // Pre-populate DeepSeek key from existing .env (if any) so users with
   // a partial config don't have to retype.
   if (window.electronAPI && window.electronAPI.getFirstRunStatus) {
     window.electronAPI.getFirstRunStatus().then((s) => {

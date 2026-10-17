@@ -46,13 +46,13 @@ Options:
   -h, --help              Show this help
 
 Environment variables:
-  GEMINI_API_KEY          If provided, writes into .env
+  DEEPSEEK_API_KEY        If provided, writes into .env
   WHISPER_MODEL           Whisper model to configure (default: turbo)
   WHISPER_LANGUAGE        Whisper language to configure (default: en)
   WHISPER_SEGMENT_MS      Segment size in ms (default: 4000)
 
 Example:
-  GEMINI_API_KEY=your_key_here ./setup.sh --install-system-deps
+  DEEPSEEK_API_KEY=your_key_here ./setup.sh --install-system-deps
 EOF
 }
 
@@ -135,32 +135,32 @@ upsert_env() {
   fi
 }
 
-ensure_gemini_key() {
-  if [[ -n "${GEMINI_API_KEY:-}" ]]; then
-    upsert_env "GEMINI_API_KEY" "$GEMINI_API_KEY"
+ensure_deepseek_key() {
+  if [[ -n "${DEEPSEEK_API_KEY:-}" ]]; then
+    upsert_env "DEEPSEEK_API_KEY" "$DEEPSEEK_API_KEY"
   fi
 
-  # GEMINI_API_KEY is now OPTIONAL during setup. The app's first-run
+  # DEEPSEEK_API_KEY is now OPTIONAL during setup. The app's first-run
   # flow will auto-open the Settings window if the key is missing and
   # guide the user to enter it. Hard-blocking at install time makes
   # CI / packaging / scripted installs harder for no real benefit.
 
-  if ! grep -q '^GEMINI_API_KEY=' .env 2>/dev/null; then
+  if ! grep -q '^DEEPSEEK_API_KEY=' .env 2>/dev/null; then
     # Make sure the key exists in .env even if unset — the app reads
     # this on first-run to know whether onboarding is needed.
-    echo "GEMINI_API_KEY=your_gemini_api_key_here" >> .env
+    echo "DEEPSEEK_API_KEY=your_deepseek_api_key_here" >> .env
   fi
 
-  if grep -q 'your_gemini_api_key_here' .env 2>/dev/null; then
+  if grep -q 'your_deepseek_api_key_here' .env 2>/dev/null; then
     echo ""
     echo "=========================================="
-    echo " No Gemini API key detected"
+    echo " No DeepSeek API key detected"
     echo "=========================================="
     echo ""
     echo "The app will start, but AI features won't work until you set"
-    echo "GEMINI_API_KEY in .env (or via the Settings window on first launch)."
+    echo "DEEPSEEK_API_KEY in .env (or via the Settings window on first launch)."
     echo ""
-    echo "Get a free key from: https://aistudio.google.com/"
+    echo "Get a key from: https://platform.deepseek.com/api_keys"
     echo ""
     echo "Setup will continue without blocking."
     echo ""
@@ -310,7 +310,7 @@ echo "Node: $(node -v)"
 echo "npm:  $(npm -v)"
 
 ensure_env_file
-ensure_gemini_key
+ensure_deepseek_key
 install_system_deps
 install_node_deps
 setup_whisper_env

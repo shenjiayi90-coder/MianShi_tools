@@ -9,8 +9,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Speech recognition
   startSpeechRecognition: () => ipcRenderer.invoke('start-speech-recognition'),
   stopSpeechRecognition: () => ipcRenderer.invoke('stop-speech-recognition'),
-  sendAudioChunk: (buffer) => ipcRenderer.send('audio-chunk', { buffer }),
+  sendAudioChunk: (buffer, channel) => ipcRenderer.send('audio-chunk', { buffer, channel }),
   getSpeechAvailability: () => ipcRenderer.invoke('get-speech-availability'),
+  getShortcutStatus: () => ipcRenderer.invoke('get-shortcut-status'),
+  onShortcutStatus: (callback) => ipcRenderer.on('shortcut-status', callback),
+  notifySystemAudioUnavailable: () => ipcRenderer.send('system-audio-unavailable'),
   
   // Window management
   showAllWindows: () => ipcRenderer.invoke('show-all-windows'),
@@ -31,7 +34,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   sendChatMessage: (text) => ipcRenderer.invoke('send-chat-message', text),
   getSkillPrompt: (skillName) => ipcRenderer.invoke('get-skill-prompt', skillName),
   
-  // Gemini LLM configuration
+  // LLM (DeepSeek) configuration
+  setDeepSeekApiKey: (apiKey) => ipcRenderer.invoke('set-deepseek-api-key', apiKey),
+  getLlmStatus: () => ipcRenderer.invoke('get-llm-status'),
+  testLlmConnection: () => ipcRenderer.invoke('test-llm-connection'),
+
+  // Legacy aliases retained so existing renderer code keeps working.
   setGeminiApiKey: (apiKey) => ipcRenderer.invoke('set-gemini-api-key', apiKey),
   getGeminiStatus: () => ipcRenderer.invoke('get-gemini-status'),
   testGeminiConnection: () => ipcRenderer.invoke('test-gemini-connection'),
