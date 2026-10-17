@@ -81,7 +81,16 @@ class WhisperWorkerService {
     this.closing = false;
     const child = spawn(this.pythonPath, ['-u', this.scriptPath], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true
+      windowsHide: true,
+      // Force UTF-8 stdio. On non-UTF-8 Windows locales (zh-CN/ja-JP/ko-KR)
+      // Python defaults to the legacy ANSI code page, and any non-ASCII
+      // character in a transcript or traceback kills the worker with
+      // UnicodeEncodeError before it can reply.
+      env: {
+        ...process.env,
+        PYTHONIOENCODING: 'utf-8',
+        PYTHONUTF8: '1'
+      }
     });
     this.process = child;
 

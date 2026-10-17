@@ -118,6 +118,12 @@ class MainWindowUI {
                 this.speechAvailable = await window.electronAPI.getSpeechAvailability();
                 this.applyMicVisibility();
             }
+            // Pull the live shortcut map once at startup; the main process also
+            // broadcasts it whenever shortcuts are (re)registered.
+            if (window.electronAPI && window.electronAPI.getShortcutStatus) {
+                const status = await window.electronAPI.getShortcutStatus();
+                this.applyShortcutStatus(status);
+            }
         } catch (e) {
             this.speechAvailable = false;
             this.applyMicVisibility();
@@ -417,6 +423,67 @@ class MainWindowUI {
         }
     }
 
+    /**
+     * Reflect the shortcuts that actually bound.
+     *
+     * The documented default (Alt+R) is frequently taken by GeForce
+     * Experience's overlay, in which case the app silently binds a fallback.
+     * Showing the real key — and warning when Alt+R was lost — is the
+     * difference between "the hotkey is broken" and "the hotkey moved".
+     */
+    applyShortcutStatus(status) {
+        if (!status) return;
+        this.speechShortcut = status.speech || null;
+
+        const cell = document.getElementById('speechShortcutCell');
+        if (cell) {
+            if (this.speechShortcut) {
+                const parts = String(this.speechShortcut)
+                    .replace('CommandOrControl', 'Ctrl/Cmd')
+                    .replace('Command', 'Cmd')
+                    .split('+');
+                cell.innerHTML = parts
+                    .map((p) => `<span class="kbd">${p}</span>`)
+                    .join(' + ');
+            } else {
+                // Nothing bound: point the user at the on-screen button.
+                cell.innerHTML = '<span style="opacity:.7">Use the mic button</span>';
+            }
+        }
+
+        const warning = document.getElementById('shortcutWarning');
+        if (warning) {
+            const pretty = (accel) => String(accel)
+                .replace('CommandOrControl', 'Ctrl')
+                .replace('Command', 'Cmd');
+            const taken = Array.isArray(status.takenSpeechKeys) ? status.takenSpeechKeys : [];
+            if (taken.includes('Alt+R') && this.speechShortcut && this.speechShortcut !== 'Alt+R') {
+                warning.textContent =
+                    `Alt+R is taken by another app (GeForce Experience, etc.) — speech is now ${pretty(this.speechShortcut)}.`;
+                warning.style.display = '';
+            } else if (!this.speechShortcut) {
+                warning.textContent = 'No speech hotkey available — click the microphone button instead.';
+                warning.style.display = '';
+            } else {
+                warning.style.display = 'none';
+            }
+        }
+
+        // Tooltip on the mic button so the key is discoverable on hover.
+        if (this.micButton && this.speechShortcut) {
+            const pretty = String(this.speechShortcut)
+                .replace('CommandOrControl', 'Ctrl')
+                .replace('Command', 'Cmd');
+            this.micButton.title = `Toggle speech (${pretty})`;
+        }
+
+        logger.info('Shortcut status applied', {
+            component: 'MainWindowUI',
+            speech: this.speechShortcut,
+            failed: status.failed
+        });
+    }
+
     setupEventListeners() {
         if (window.electronAPI) {
             // Fix interaction mode change listener
@@ -443,6 +510,14 @@ class MainWindowUI {
                 this.speechAvailable = !!(data && data.available);
                 this.applyMicVisibility();
             });
+
+            // The speech key can differ from the documented Alt+R when another
+            // app (GeForce Experience, Xbox Game Bar, …) already owns it.
+            if (window.electronAPI.onShortcutStatus) {
+                window.electronAPI.onShortcutStatus((event, data) => {
+                    this.applyShortcutStatus(data);
+                });
+            }
 
             // Listen for coding language changes from other windows
             window.electronAPI.onCodingLanguageChanged((event, data) => {
@@ -675,11 +750,15 @@ class MainWindowUI {
      * Capture microphone audio in the renderer using the Web Audio API.
      * This is used for Whisper on Windows where node-record-lpcm16's sox/rec
      * dependencies are unavailable.
+     *
+     * Also starts the system-audio (loopback) channel when enabled, so the
+     * interviewer's voice is transcribed separately from the candidate's.
      */
     async _startRendererAudioCapture() {
         try {
             this._stopRendererAudioCapture();
 
+            // ── Microphone channel: the candidate's own voice ──
             const stream = await navigator.mediaDevices.getUserMedia({
                 audio: {
                     echoCancellation: true,
@@ -691,32 +770,30 @@ class MainWindowUI {
             this._mediaStream = stream;
 
             const audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                // 16 kHz mono is what Whisper wants. Chromium resamples every
+                // source feeding this context, which keeps both channels (mic
+                // and 48 kHz loopback) at one consistent rate downstream.
                 sampleRate: 16000
             });
             this._audioContext = audioContext;
+            logger.info('Audio context created', {
+                component: 'MainWindowUI',
+                requestedRate: 16000,
+                actualRate: audioContext.sampleRate
+            });
 
-            const source = audioContext.createMediaStreamSource(stream);
-            const bufferSize = 4096;
-            const scriptNode = audioContext.createScriptProcessor(bufferSize, 1, 1);
-            this._scriptNode = scriptNode;
+            this._attachChannelCapture(audioContext, stream, 'mic');
 
-            scriptNode.onaudioprocess = (event) => {
-                if (!this.isRecording || !window.electronAPI || !window.electronAPI.sendAudioChunk) {
-                    return;
-                }
-                const inputData = event.inputBuffer.getChannelData(0);
-                const pcm16 = new Int16Array(inputData.length);
-                for (let i = 0; i < inputData.length; i++) {
-                    const s = Math.max(-1, Math.min(1, inputData[i]));
-                    pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-                }
-                window.electronAPI.sendAudioChunk(pcm16.buffer);
-            };
+            // ── System-audio channel: the interviewer ──
+            // getDisplayMedia with audio is the only way a renderer can reach
+            // the call's output mix. It is best-effort: a denial or an
+            // unsupported platform must not break the microphone path.
+            await this._startSystemAudioCapture(audioContext);
 
-            source.connect(scriptNode);
-            scriptNode.connect(audioContext.destination);
-
-            logger.info('Renderer audio capture started', { component: 'MainWindowUI' });
+            logger.info('Renderer audio capture started', {
+                component: 'MainWindowUI',
+                systemAudio: !!this._systemAudioStream
+            });
         } catch (error) {
             logger.error('Failed to start renderer audio capture', {
                 component: 'MainWindowUI',
@@ -729,12 +806,217 @@ class MainWindowUI {
         }
     }
 
+    /**
+     * Wire one MediaStream into a PCM16 → IPC pump tagged with `channelId`.
+     *
+     * Extracted so the mic and system-audio paths share identical encoding.
+     * Both are downmixed to mono and resampled to 16 kHz — the rate Whisper
+     * expects. The browser resamples, and `sampleRate` on the AudioContext is
+     * honoured by Chromium, but a loopback stream is usually 48 kHz stereo, so
+     * the explicit mono downmix matters: taking only channel 0 silently loses
+     * anything panned right.
+     *
+     * @param {AudioContext} audioContext
+     * @param {MediaStream} stream
+     * @param {'mic'|'system'} channelId
+     */
+    _attachChannelCapture(audioContext, stream, channelId) {
+        const source = audioContext.createMediaStreamSource(stream);
+
+        // Loopback audio arrives at the call's own level, which can be very
+        // quiet if the user keeps their meeting volume low. A modest boost is
+        // applied here (not on the mic, which is already gain-controlled by
+        // autoGainControl) so Whisper sees a healthy signal.
+        const gainNode = audioContext.createGain();
+        gainNode.gain.value = channelId === 'system' ? 1.8 : 1.0;
+
+        // A ScriptProcessor is deprecated but remains the most predictable way
+        // to get raw PCM out of a renderer without an AudioWorklet module file
+        // (which Electron would need to serve over a URL). 4096 frames at
+        // 16 kHz ≈ 256 ms per chunk.
+        const bufferSize = 4096;
+        const scriptNode = audioContext.createScriptProcessor(bufferSize, 1, 1);
+
+        scriptNode.onaudioprocess = (event) => {
+            if (!this.isRecording || !window.electronAPI || !window.electronAPI.sendAudioChunk) {
+                return;
+            }
+            const inputData = event.inputBuffer.getChannelData(0);
+            const pcm16 = new Int16Array(inputData.length);
+            for (let i = 0; i < inputData.length; i++) {
+                const s = Math.max(-1, Math.min(1, inputData[i]));
+                pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            window.electronAPI.sendAudioChunk(pcm16.buffer, channelId);
+        };
+
+        source.connect(gainNode);
+        gainNode.connect(scriptNode);
+        // A ScriptProcessor only runs while connected to a destination. Route it
+        // through a muted gain node so we never echo the call back into the room.
+        const mute = audioContext.createGain();
+        mute.gain.value = 0;
+        scriptNode.connect(mute);
+        mute.connect(audioContext.destination);
+
+        const nodeRefs = { source, gainNode, scriptNode, mute };
+        if (channelId === 'mic') {
+            this._micNodes = nodeRefs;
+            this._scriptNode = scriptNode;
+            this._micGainNode = mute;
+        } else {
+            this._systemNodes = nodeRefs;
+            this._systemScriptNode = scriptNode;
+            this._systemGainNode = mute;
+        }
+        return scriptNode;
+    }
+
+    /**
+     * Try to capture system audio (what the call is playing) via
+     * getDisplayMedia. This is what makes the interviewer's questions
+     * distinguishable from the candidate's own speech.
+     *
+     * Failure is expected and non-fatal on platforms/permissions that do not
+     * allow it, so it is swallowed with a log line.
+     */
+    async _startSystemAudioCapture(audioContext) {
+        const enabled = await this._isSystemAudioEnabled();
+        if (!enabled) {
+            return;
+        }
+        if (!navigator.mediaDevices || typeof navigator.mediaDevices.getDisplayMedia !== 'function') {
+            logger.warn('System audio capture unavailable: getDisplayMedia not supported', {
+                component: 'MainWindowUI'
+            });
+            return;
+        }
+
+        try {
+            // NOTE: Electron has no built-in picker. The main process registers
+            // `setDisplayMediaRequestHandler`, which auto-selects the primary
+            // screen and attaches loopback audio — so this resolves without any
+            // dialog, and a rejection means the handler is missing or failed.
+            const displayStream = await navigator.mediaDevices.getDisplayMedia({
+                // Video is mandatory: Chromium refuses an audio-only
+                // getDisplayMedia request. The track is stopped immediately
+                // afterwards so nothing is actually recorded.
+                video: true,
+                audio: {
+                    // Loopback audio must NOT be processed: echo cancellation
+                    // and noise suppression are tuned for a room microphone and
+                    // actively damage clean digital audio from a call — they
+                    // gate quiet speech and can cancel the far end entirely.
+                    echoCancellation: false,
+                    noiseSuppression: false,
+                    autoGainControl: false,
+                    // Ask for stereo at a normal rate; the AudioContext
+                    // downmixes to mono 16 kHz. Requesting 16 kHz directly made
+                    // Chromium resample a 48 kHz loopback badly.
+                    channelCount: { ideal: 2 },
+                    sampleRate: { ideal: 48000 },
+                    sampleSize: { ideal: 16 }
+                }
+            });
+
+            const audioTracks = displayStream.getAudioTracks();
+            if (!audioTracks.length) {
+                displayStream.getTracks().forEach((t) => t.stop());
+                logger.warn('System audio capture skipped: the granted stream carried no audio track', {
+                    component: 'MainWindowUI',
+                    videoTracks: displayStream.getVideoTracks().length,
+                    hint: 'Electron setDisplayMediaRequestHandler must pass audio: "loopback" on Windows'
+                });
+                try {
+                    window.electronAPI.notifySystemAudioUnavailable &&
+                        window.electronAPI.notifySystemAudioUnavailable();
+                } catch (_) { /* ignore */ }
+                return;
+            }
+
+            // Drop the video track immediately: we only want the audio, and
+            // keeping it would leave a screen-sharing indicator on for nothing.
+            displayStream.getVideoTracks().forEach((t) => t.stop());
+
+            const audioOnly = new MediaStream(audioTracks);
+            this._systemAudioStream = displayStream;
+            this._attachChannelCapture(audioContext, audioOnly, 'system');
+
+            // If the user stops sharing from the OS UI, tear the channel down.
+            audioTracks[0].addEventListener('ended', () => {
+                logger.info('System audio share ended by the user', { component: 'MainWindowUI' });
+                this._stopSystemAudioCapture();
+            });
+
+            logger.info('System audio capture started', { component: 'MainWindowUI' });
+        } catch (error) {
+            // A user cancelling the picker lands here too — that is not an error.
+            logger.warn('System audio capture not started', {
+                component: 'MainWindowUI',
+                error: error.message
+            });
+            try {
+                window.electronAPI.notifySystemAudioUnavailable &&
+                    window.electronAPI.notifySystemAudioUnavailable();
+            } catch (_) { /* ignore */ }
+        }
+    }
+
+    async _isSystemAudioEnabled() {
+        try {
+            const settings = await window.electronAPI.getSettings();
+            return !!(settings && settings.whisperSystemAudio);
+        } catch (_) {
+            return false;
+        }
+    }
+
+    _stopSystemAudioCapture() {
+        try {
+            if (this._systemNodes) {
+                try { this._systemNodes.source.disconnect(); } catch (_) {}
+                try { this._systemNodes.gainNode.disconnect(); } catch (_) {}
+                try { this._systemNodes.mute.disconnect(); } catch (_) {}
+                this._systemNodes = null;
+            }
+            if (this._systemScriptNode) {
+                this._systemScriptNode.disconnect();
+                this._systemScriptNode.onaudioprocess = null;
+                this._systemScriptNode = null;
+            }
+            if (this._systemGainNode) {
+                this._systemGainNode.disconnect();
+                this._systemGainNode = null;
+            }
+            if (this._systemAudioStream) {
+                this._systemAudioStream.getTracks().forEach((t) => t.stop());
+                this._systemAudioStream = null;
+            }
+        } catch (error) {
+            logger.error('Error stopping system audio capture', {
+                component: 'MainWindowUI',
+                error: error.message
+            });
+        }
+    }
+
     _stopRendererAudioCapture() {
         try {
+            this._stopSystemAudioCapture();
+            if (this._micNodes) {
+                try { this._micNodes.source.disconnect(); } catch (_) {}
+                try { this._micNodes.gainNode.disconnect(); } catch (_) {}
+                try { this._micNodes.mute.disconnect(); } catch (_) {}
+                this._micNodes = null;
+            }
             if (this._scriptNode) {
                 this._scriptNode.disconnect();
                 this._scriptNode.onaudioprocess = null;
                 this._scriptNode = null;
+            }
+            if (this._micGainNode) {
+                this._micGainNode.disconnect();
+                this._micGainNode = null;
             }
             if (this._mediaStream) {
                 this._mediaStream.getTracks().forEach((track) => track.stop());
@@ -1003,18 +1285,18 @@ class MainWindowUI {
 
     async showGeminiConfig() {
         try {
-            const status = await window.electronAPI.getGeminiStatus();
-            
+            const status = await window.electronAPI.getLlmStatus();
+
             const modal = this.createGeminiConfigModal(status);
             document.body.appendChild(modal);
-            
-            logger.debug('Gemini config modal shown', { component: 'MainWindowUI' });
+
+            logger.debug('DeepSeek config modal shown', { component: 'MainWindowUI' });
         } catch (error) {
-            logger.error('Failed to show Gemini config', {
+            logger.error('Failed to show DeepSeek config', {
                 component: 'MainWindowUI',
                 error: error.message
             });
-            this.showNotification('Failed to load Gemini configuration', 'error');
+            this.showNotification('Failed to load DeepSeek configuration', 'error');
         }
     }
 
@@ -1024,21 +1306,21 @@ class MainWindowUI {
         modal.innerHTML = `
             <div class="bg-gray-900 text-white p-6 rounded-lg max-w-md w-full">
                 <div class="flex justify-between items-center mb-4">
-                    <h2 class="text-xl font-bold">🤖 Gemini Flash 1.5 Configuration</h2>
+                    <h2 class="text-xl font-bold">🤖 DeepSeek Configuration</h2>
                     <button class="text-gray-400 hover:text-white" onclick="this.closest('.fixed').remove()">✕</button>
                 </div>
                 
                 <div class="mb-4 p-3 rounded ${status.hasApiKey ? 'bg-green-900' : 'bg-red-900'}">
                     <p><strong>Status:</strong> ${status.hasApiKey ? 'Configured' : 'Not Configured'}</p>
-                    <p><strong>Model:</strong> ${status.model}</p>
+                    <p><strong>Model:</strong> ${status.model || 'deepseek-flash'}</p>
                 </div>
                 
                 <div class="mb-4">
                     <label class="block text-sm font-medium mb-2">API Key:</label>
-                    <input type="password" id="geminiApiKey" placeholder="Enter your Gemini API key" 
+                    <input type="password" id="geminiApiKey" placeholder="sk-..." 
                            class="w-full p-2 bg-gray-800 border border-gray-600 rounded text-white">
                     <p class="text-xs text-gray-400 mt-1">
-                        Get your API key from: <a href="https://aistudio.google.com/app/apikey" target="_blank" class="text-blue-400">Google AI Studio</a>
+                        Get your API key from: <a href="https://platform.deepseek.com/api_keys" target="_blank" class="text-blue-400">DeepSeek Platform</a>
                     </p>
                 </div>
                 
@@ -1069,22 +1351,21 @@ class MainWindowUI {
         }
         
         try {
-            const result = await window.electronAPI.setGeminiApiKey(apiKey);
-            if (result.success) {
-                this.showNotification('Gemini API key configured successfully!', 'success');
+            const result = await window.electronAPI.setDeepSeekApiKey(apiKey);
+            if (result.isInitialized) {
+                this.showNotification('DeepSeek API key configured successfully!', 'success');
                 document.querySelector('.fixed').remove();
                 
-                logger.info('Gemini API key configured', { component: 'MainWindowUI' });
+                logger.info('DeepSeek API key configured', { component: 'MainWindowUI' });
             } else {
-                this.showNotification(`Configuration failed: ${result.error}`, 'error');
-                logger.error('Gemini configuration failed', {
-                    component: 'MainWindowUI',
-                    error: result.error
+                this.showNotification('Configuration failed: the key was not accepted', 'error');
+                logger.error('DeepSeek configuration failed', {
+                    component: 'MainWindowUI'
                 });
             }
         } catch (error) {
             this.showNotification(`Error: ${error.message}`, 'error');
-            logger.error('Gemini configuration error', {
+            logger.error('DeepSeek configuration error', {
                 component: 'MainWindowUI',
                 error: error.message
             });
@@ -1093,20 +1374,20 @@ class MainWindowUI {
 
     async testGeminiConnection() {
         try {
-            const result = await window.electronAPI.testGeminiConnection();
+            const result = await window.electronAPI.testLlmConnection();
             if (result.success) {
-                this.showNotification('Gemini connection test successful!', 'success');
-                logger.info('Gemini connection test successful', { component: 'MainWindowUI' });
+                this.showNotification(`DeepSeek connection test successful! (${result.model})`, 'success');
+                logger.info('DeepSeek connection test successful', { component: 'MainWindowUI' });
             } else {
                 this.showNotification(`Connection test failed: ${result.error}`, 'error');
-                logger.error('Gemini connection test failed', {
+                logger.error('DeepSeek connection test failed', {
                     component: 'MainWindowUI',
                     error: result.error
                 });
             }
         } catch (error) {
             this.showNotification(`Error: ${error.message}`, 'error');
-            logger.error('Gemini connection test error', {
+            logger.error('DeepSeek connection test error', {
                 component: 'MainWindowUI',
                 error: error.message
             });

@@ -936,11 +936,25 @@ class WindowManager {
 
     // This is only a capture availability probe. desktopCapturer.getSources()
     // cannot tell whether another app is currently sharing the screen.
+    //
+    // It is deliberately infrequent. Every poll makes Chromium enumerate and
+    // thumbnail *all* screens and windows through Windows Graphics Capture, and
+    // any source it cannot grab (virtual displays from ToDesk / Oray / GameViewer,
+    // minimized or protected windows) logs
+    //   ERROR:wgc_capturer_win.cc(255) Source is not capturable.
+    // once per unsupported source. Polling every 5s turned that into a steady
+    // stream of noise, so it now runs every 60s and never on machines where the
+    // check has already proven unusable.
+    if (this.screenCaptureProbeDisabled) {
+      logger.info('Screen capture availability watcher not started (probe disabled)');
+      return;
+    }
+
     this.screenCaptureAvailabilityWatcher = setInterval(async () => {
       await this.checkScreenCaptureAvailability();
-    }, 5000); // Check every 5 seconds instead of 1
+    }, 60000);
 
-    logger.info('Screen capture availability watcher initialized');
+    logger.info('Screen capture availability watcher initialized', { intervalMs: 60000 });
   }
 
   async checkScreenCaptureAvailability() {
@@ -954,8 +968,13 @@ class WindowManager {
     const checkedAt = new Date().toISOString();
 
     try {
+      // Only enumerate screens. Asking for 'window' too doubles the number of
+      // sources Chromium tries to thumbnail, and every ungrabbable window
+      // (protected DRM surfaces, minimized UWP apps) emits its own
+      // wgc_capturer_win.cc error. The result is used only to answer "can we
+      // enumerate at all", which screens alone answer.
       await desktopCapturer.getSources({
-        types: ['screen', 'window'],
+        types: ['screen'],
         thumbnailSize: { width: 1, height: 1 }
       });
 
@@ -964,6 +983,8 @@ class WindowManager {
         lastError: null,
         lastCheckedAt: checkedAt
       };
+
+      this.screenCaptureProbeFailures = 0;
 
       if (previousAvailability === false) {
         logger.info('Screen capture enumeration recovered');
@@ -984,6 +1005,22 @@ class WindowManager {
         logger.debug('Screen capture enumeration still unavailable', logContext);
       } else {
         logger.warn('Screen capture enumeration unavailable; leaving screen sharing mode unchanged', logContext);
+      }
+
+      // If enumeration fails repeatedly the environment simply cannot support
+      // it (headless session, restricted desktop, agent without a capture
+      // device). Keep polling would only spam the log, so stop.
+      this.screenCaptureProbeFailures = (this.screenCaptureProbeFailures || 0) + 1;
+      if (this.screenCaptureProbeFailures >= 3) {
+        this.screenCaptureProbeDisabled = true;
+        if (this.screenCaptureAvailabilityWatcher) {
+          clearInterval(this.screenCaptureAvailabilityWatcher);
+          this.screenCaptureAvailabilityWatcher = null;
+        }
+        logger.warn('Screen capture availability probe disabled after repeated failures', {
+          failures: this.screenCaptureProbeFailures,
+          lastError: error.message
+        });
       }
     } finally {
       this.isCheckingScreenCaptureStatus = false;
