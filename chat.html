@@ -1302,9 +1302,21 @@
         });
       }
 
-      // Global keyboard shortcuts
+      // In-window speech shortcut. This only fires while the chat window has
+      // focus; the global hotkey is handled in the main process. The label is
+      // refreshed from the main process so it matches whichever key actually
+      // bound (Alt+R is often taken by GeForce Experience).
+      let speechShortcutLabel = 'Alt+R';
+      if (window.electronAPI && window.electronAPI.getShortcutStatus) {
+        window.electronAPI.getShortcutStatus().then((s) => {
+          if (s && s.speechLabel) speechShortcutLabel = s.speechLabel;
+        }).catch(() => {});
+      }
+
       document.addEventListener('keydown', (e) => {
-        if (e.altKey && e.key === 'r') {
+        // Match Alt+R regardless of what the global binding ended up being, so
+        // the in-window key keeps working even when the global one moved.
+        if (e.altKey && (e.key === 'r' || e.key === 'R')) {
           e.preventDefault();
           if (!isInteractive || !speechAvailable) return;
           micButton && micButton.click();
@@ -1313,7 +1325,7 @@
 
       // Initialize
       if (!chatHistory || chatHistory.length === 0) {
-        addMessage('Recording in Progress. press Alt+R to stop recording.', 'system');
+        addMessage('Recording in Progress. press Alt+R (or the mic button) to stop recording.', 'system');
       }
     </script>
   </body>
