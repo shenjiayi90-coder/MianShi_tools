@@ -121,6 +121,36 @@ class SessionManager {
   }
 
   /**
+   * Remove a previously recorded user input whose content matches `text`.
+   *
+   * Used to withdraw an acoustic echo: the microphone sometimes transcribes
+   * the interviewer's sentence before the loopback channel does, so the wrong
+   * (echo) copy is already in memory by the time the authoritative one lands.
+   * Leaving it there would feed the duplicate into the LLM's context.
+   *
+   * Only the most recent matching entry is removed, and only if it was speech —
+   * typed input is never retracted.
+   *
+   * @param {string} text the transcript to withdraw
+   * @returns {boolean} true when an entry was removed
+   */
+  removeLastUserInputMatching(text) {
+    const target = String(text || '').trim();
+    if (!target) return false;
+    if (!Array.isArray(this.conversationHistory)) return false;
+
+    for (let i = this.conversationHistory.length - 1; i >= 0; i--) {
+      const event = this.conversationHistory[i];
+      if (!event || event.role !== 'user') continue;
+      if (event.action !== 'speech_transcription') continue;
+      if (String(event.content || '').trim() !== target) continue;
+      this.conversationHistory.splice(i, 1);
+      return true;
+    }
+    return false;
+  }
+
+  /**
    * Add LLM/model response
    */
   addModelResponse(text, metadata = {}) {
@@ -298,7 +328,7 @@ class SessionManager {
     if (actionLower.includes('speech') || actionLower.includes('transcription')) {
       return 'speech';
     }
-    if (actionLower.includes('llm') || actionLower.includes('gemini')) {
+    if (actionLower.includes('llm') || actionLower.includes('gemini') || actionLower.includes('deepseek')) {
       return 'llm';
     }
     if (actionLower.includes('skill') || actionLower.includes('switch')) {

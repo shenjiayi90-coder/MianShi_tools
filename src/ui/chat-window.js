@@ -81,6 +81,17 @@ class ChatWindowUI {
                     console.warn('Transcription event received but no text data:', data);
                 }
             });
+
+            // Withdraw a bubble that turned out to be an acoustic echo of the
+            // other channel (the microphone can beat the loopback channel to
+            // the same sentence).
+            if (window.electronAPI.receive) {
+                window.electronAPI.receive('transcription-retracted', (event, data) => {
+                    if (data && data.text) {
+                        this.handleTranscriptionRetracted(data.text);
+                    }
+                });
+            }
             
             // Listen for interim transcription (real-time)
             if (window.electronAPI.onInterimTranscription) {
@@ -282,6 +293,32 @@ class ChatWindowUI {
             logger.debug('Transcription received in chat', { textLength: text.length });
         } else {
             console.warn('❌ Transcription text is empty or invalid:', text);
+        }
+    }
+
+    /**
+     * Withdraw a transcript bubble that turned out to be an acoustic echo.
+     *
+     * The microphone often transcribes the interviewer's sentence before the
+     * loopback channel does, so the wrong copy is already rendered. The
+     * authoritative (interviewer) copy arrives a moment later and replaces it,
+     * which is better than showing the same sentence twice under two speakers.
+     */
+    handleTranscriptionRetracted(text) {
+        const target = String(text || '').trim();
+        if (!target || !this.elements.chatMessages) return;
+
+        // Walk backwards: the duplicate is the most recent bubble with this text.
+        const bubbles = this.elements.chatMessages.querySelectorAll('.message.transcription');
+        for (let i = bubbles.length - 1; i >= 0; i--) {
+            const bubble = bubbles[i];
+            const textDiv = bubble.querySelector('.message-text');
+            if (!textDiv) continue;
+            if (textDiv.textContent.trim() !== target) continue;
+
+            bubble.remove();
+            logger.debug('Removed echoed transcript bubble', { textLength: target.length });
+            return;
         }
     }
 
