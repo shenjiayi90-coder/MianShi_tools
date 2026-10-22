@@ -13,6 +13,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getSpeechAvailability: () => ipcRenderer.invoke('get-speech-availability'),
   getShortcutStatus: () => ipcRenderer.invoke('get-shortcut-status'),
   onShortcutStatus: (callback) => ipcRenderer.on('shortcut-status', callback),
+  getRequestMetrics: () => ipcRenderer.invoke('get-request-metrics'),
+  debugTopmostProbe: () => ipcRenderer.invoke('debug-topmost-probe'),
   notifySystemAudioUnavailable: () => ipcRenderer.send('system-audio-unavailable'),
   
   // Window management

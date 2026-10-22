@@ -76,7 +76,7 @@ class ChatWindowUI {
             // Speech recognition handlers
             window.electronAPI.onTranscriptionReceived((event, data) => {
                 if (data && data.text) {
-                    this.handleTranscription(data.text);
+                    this.handleTranscription(data.text, data);
                 } else {
                     console.warn('Transcription event received but no text data:', data);
                 }
@@ -275,22 +275,32 @@ class ChatWindowUI {
         logger.debug('Recording stopped in chat window');
     }
 
-    handleTranscription(text) {
+    handleTranscription(text, meta = {}) {
         if (text && text.trim()) {
             // Hide listening animation first
             this.hideListeningAnimation();
-            
+
             // Show transcribed text with a slight delay for smooth transition
             setTimeout(() => {
                 this.addMessage(text, 'transcription');
-                
-                // Show thinking indicator after transcription
-                setTimeout(() => {
-                    this.showThinkingIndicator();
-                }, 300);
+
+                // Only show the "thinking" placeholder when an answer will
+                // actually follow. The candidate's own lines are recorded as
+                // context but never answered; a spinner for them would sit
+                // there forever and bury the previous answer the user is
+                // reading.
+                if (meta.willAnswer) {
+                    setTimeout(() => {
+                        this.showThinkingIndicator();
+                    }, 300);
+                }
             }, 200);
-            
-            logger.debug('Transcription received in chat', { textLength: text.length });
+
+            logger.debug('Transcription received in chat', {
+                textLength: text.length,
+                willAnswer: !!meta.willAnswer,
+                speaker: meta.speaker || null
+            });
         } else {
             console.warn('❌ Transcription text is empty or invalid:', text);
         }

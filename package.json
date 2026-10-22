@@ -12,6 +12,7 @@
     "test:dual": "node scripts/test-dual-channel.js",
     "test:dashscope": "node scripts/test-dashscope.js",
     "test:echo": "node scripts/test-echo-suppressor.js",
+    "test:metrics": "node scripts/test-request-metrics.js",
     "test:dashscope:full": "node scripts/test-dashscope-integration.js",
     "verify:app": "node scripts/cdp-verify.js",
     "build": "electron-builder",

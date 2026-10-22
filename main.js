@@ -713,6 +713,39 @@ class ApplicationController {
       };
     });
 
+    // TTFT and context utilisation of the last request, plus a short trend.
+    // The renderer polls this to drive the latency/context gauges.
+    ipcMain.handle("get-request-metrics", () => {
+      return llmService.getMetricsSnapshot();
+    });
+
+    // Temporary diagnostics: probe Electron's setAlwaysOnTop behaviour on the
+    // live windows so the stacking bug can be pinned down from inside the
+    // process instead of guessed at through Win32.
+    ipcMain.handle("debug-topmost-probe", () => {
+      const results = {};
+      BrowserWindow.getAllWindows().forEach((win) => {
+        if (win.isDestroyed()) return;
+        const name = win.webContents.getURL().split("/").pop() || win.getTitle();
+        const probe = {};
+        try {
+          probe.beforeFlag = win.isAlwaysOnTop();
+          win.setAlwaysOnTop(false);
+          win.setAlwaysOnTop(true);
+          probe.afterFlag = win.isAlwaysOnTop();
+          // Also try with explicit level
+          win.setAlwaysOnTop(true, "screen-saver");
+          probe.afterScreenSaver = win.isAlwaysOnTop();
+          probe.visible = win.isVisible();
+        } catch (error) {
+          probe.error = error.message;
+        }
+        results[name] = probe;
+      });
+      logger.info("Topmost probe", results);
+      return results;
+    });
+
     ipcMain.handle("start-speech-recognition", () => {
       speechService.startRecording();
       return speechService.getStatus();
@@ -1567,7 +1600,12 @@ class ApplicationController {
     this.sendToVoiceResponseWindows("transcription-received", {
       text: labelled,
       speaker,
-      channel: channelId
+      channel: channelId,
+      // Tells the renderers whether an LLM answer will follow this line. The
+      // candidate's own speech is recorded but never answered, so showing a
+      // "thinking" placeholder for it would sit there spinning forever and
+      // bury the previous answer the user is trying to read.
+      willAnswer: shouldAnswer
     });
 
     if (!shouldAnswer) {

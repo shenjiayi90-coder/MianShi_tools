@@ -4,6 +4,63 @@ const logger = require('../core/logger').createServiceLogger('LLM');
 const config = require('../core/config');
 const { promptLoader } = require('../../prompt-loader');
 const profileLoader = require('./profile-loader');
+const { MetricsCollector } = require('./request-metrics');
+
+/** Per-request TTFT / context-utilisation tracking, surfaced to the renderer. */
+const metrics = new MetricsCollector();
+
+/**
+ * Measure a streaming request: TTFT from the first delta, prompt size from the
+ * assembled request, and end-to-end duration.
+ *
+ * @param {object} request      the internal (Gemini-shaped) request about to be sent
+ * @param {string} kind         which call path this is ('chat'|'screenshot'|'voice')
+ * @param {Function} streamFn   (onDelta) => Promise<fullText>
+ * @param {Function} [onDelta]  the caller's delta callback
+ * @returns {Promise<{text: string, ttftMs: number|null, contextPercent: number|null}>}
+ */
+async function measureStream(request, kind, streamFn, onDelta) {
+  metrics.begin({ requestId: metrics.history.length + 1, kind });
+
+  // Prompt size: characters of every message plus any system instruction.
+  let promptChars = 0;
+  try {
+    for (const entry of request.contents || []) {
+      if (typeof entry === 'string') promptChars += entry.length;
+      else for (const part of entry.parts || []) {
+        if (typeof part.text === 'string') promptChars += part.text.length;
+      }
+    }
+    const sys = request.systemInstruction && request.systemInstruction.parts;
+    if (Array.isArray(sys)) {
+      for (const part of sys) {
+        if (typeof part.text === 'string') promptChars += part.text.length;
+      }
+    }
+    metrics.recordPromptChars(promptChars);
+  } catch (_) {
+    // Metrics must never break the actual request.
+  }
+
+  const wrappedDelta = (delta) => {
+    if (delta) metrics.recordFirstToken();
+    if (typeof onDelta === 'function') onDelta(delta);
+  };
+
+  let text = '';
+  try {
+    text = await streamFn(wrappedDelta);
+  } catch (error) {
+    metrics.end({ error: error.message });
+    throw error;
+  }
+  const record = metrics.end({ responseChars: text.length });
+  return {
+    text,
+    ttftMs: record ? record.ttftMs : null,
+    contextPercent: record ? record.contextPercent : null
+  };
+}
 
 class LLMService {
   constructor() {
@@ -247,11 +304,12 @@ class LLMService {
         };
       }
 
-      const fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
-        if (typeof onDelta === 'function' && delta) {
-          onDelta(delta);
-        }
-      });
+      const { text: fullText, ttftMs, contextPercent } = await measureStream(
+        geminiRequest,
+        'screenshot',
+        (onDelta) => this.executeStreamingRequest(geminiRequest, onDelta),
+        onDelta
+      );
 
       const finalResponse = programmingLanguage
         ? this.enforceProgrammingLanguage(fullText, programmingLanguage)
@@ -270,6 +328,8 @@ class LLMService {
           skill: activeSkill,
           programmingLanguage,
           processingTime: Date.now() - startTime,
+          ttftMs,
+          contextPercent,
           requestId: this.requestCount,
           usedFallback: false,
           streamed: true,
@@ -366,11 +426,12 @@ class LLMService {
     try {
       const geminiRequest = this.buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage);
 
-      const fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
-        if (typeof onDelta === 'function' && delta) {
-          onDelta(delta);
-        }
-      });
+      const { text: fullText, ttftMs, contextPercent } = await measureStream(
+        geminiRequest,
+        'chat',
+        (onDelta) => this.executeStreamingRequest(geminiRequest, onDelta),
+        onDelta
+      );
 
       const finalResponse = programmingLanguage
         ? this.enforceProgrammingLanguage(fullText, programmingLanguage)
@@ -391,7 +452,9 @@ class LLMService {
           processingTime: Date.now() - startTime,
           requestId: this.requestCount,
           usedFallback: false,
-          streamed: true
+          streamed: true,
+          ttftMs,
+          contextPercent
         }
       };
     } catch (error) {
@@ -749,6 +812,11 @@ class LLMService {
    */
   setAnsweredSpeaker(speaker) {
     this.answeredSpeaker = speaker === 'interviewer' ? 'interviewer' : 'me';
+  }
+
+  /** TTFT / context-utilisation snapshot for the UI gauges. */
+  getMetricsSnapshot() {
+    return metrics.snapshot();
   }
 
   _getAnsweredSpeaker() {
@@ -1134,11 +1202,12 @@ general/industry-standard answer the candidate can adapt.`;
     try {
       const geminiRequest = this.buildIntelligentTranscriptionRequest(text, activeSkill, sessionMemory, programmingLanguage);
 
-      const fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
-        if (typeof onDelta === 'function' && delta) {
-          onDelta(delta);
-        }
-      });
+      const { text: fullText, ttftMs, contextPercent } = await measureStream(
+        geminiRequest,
+        'voice',
+        (onDelta) => this.executeStreamingRequest(geminiRequest, onDelta),
+        onDelta
+      );
 
       const finalResponse = programmingLanguage
         ? this.enforceProgrammingLanguage(fullText, programmingLanguage)
@@ -1160,7 +1229,9 @@ general/industry-standard answer the candidate can adapt.`;
           requestId: this.requestCount,
           usedFallback: false,
           streamed: true,
-          isTranscriptionResponse: true
+          isTranscriptionResponse: true,
+          ttftMs,
+          contextPercent
         }
       };
     } catch (error) {

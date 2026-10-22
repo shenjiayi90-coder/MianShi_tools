@@ -395,6 +395,37 @@
             height: calc(100vh - 32px);
         }
 
+        /* The metrics bar adds a second fixed strip under the header. Height
+           was hard-coded as calc(100vh - 32px), so adding the bar pushed the
+           bottom of the scrollable content past the window edge: the wheel
+           still fired but the scrollable area was off-screen and the panel
+           appeared frozen. Flex layout sizes the content to whatever is left
+           after header + metrics bar, so it stays correct if either changes. */
+        .main-container {
+            display: flex;
+            flex-direction: column;
+        }
+        .main-container > #metrics-bar,
+        .main-container > .window-header {
+            flex: 0 0 auto;
+        }
+        .main-container > #response-content,
+        .main-container > #loading {
+            flex: 1 1 auto;
+            min-height: 0;      /* allow the flex child to actually shrink */
+            margin-top: 0;      /* spacing now comes from the flex stack */
+        }
+        /* The old hard-coded heights must not fight the flex sizing. */
+        .has-header #response-content,
+        .has-header #loading {
+            margin-top: 0;
+        }
+        .has-header .split-layout,
+        .has-header .full-content,
+        .has-header .loading {
+            height: 100%;
+        }
+
         .copy-btn { 
             position: absolute; 
             top: 6px; 
@@ -410,10 +441,52 @@
             transition: background 0.2s ease, border-color 0.2s ease, transform 0.12s ease;
         }
         .copy-btn:hover { background: rgba(0,0,0,0.7); }
-        .copy-btn.copied { 
-            background: rgba(76,175,80,0.85); 
-            border-color: rgba(76,175,80,0.95); 
+        .copy-btn.copied {
+            background: rgba(76,175,80,0.85);
+            border-color: rgba(76,175,80,0.95);
             transform: scale(0.98);
+        }
+
+        /* ── Latency / context gauges ── */
+        .metrics-bar {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 4px 10px;
+            background: rgba(255,255,255,0.04);
+            border-bottom: 1px solid rgba(255,255,255,0.07);
+            font-size: 11px;
+            color: rgba(255,255,255,0.55);
+            user-select: none;
+        }
+        .metrics-bar .metric { display: flex; align-items: baseline; gap: 4px; }
+        .metrics-bar .metric-label {
+            font-size: 9px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: rgba(255,255,255,0.38);
+        }
+        .metrics-bar .metric-value {
+            font-variant-numeric: tabular-nums;
+            color: rgba(255,255,255,0.85);
+        }
+        .metrics-bar .metric-value.warn { color: #ffb020; }
+        .metrics-bar .metric-value.hot { color: #ff6b6b; }
+        .metrics-bar .metric-sep { width: 1px; height: 12px; background: rgba(255,255,255,0.14); }
+        .metrics-bar .metric-bar-track {
+            flex: 1;
+            height: 4px;
+            border-radius: 2px;
+            background: rgba(255,255,255,0.10);
+            overflow: hidden;
+        }
+        .metrics-bar .metric-bar-fill {
+            display: block;
+            height: 100%;
+            width: 0%;
+            border-radius: 2px;
+            background: #4caf50;
+            transition: width 0.4s ease, background 0.4s ease;
         }
     </style>
 </head>
@@ -425,6 +498,22 @@
             <div class="window-controls">
                 <button id="close-window-btn" class="window-btn window-btn-close" title="Close">×</button>
             </div>
+        </div>
+
+        <!-- Latency / context gauges -->
+        <div id="metrics-bar" class="metrics-bar" title="First-token latency and how full the model's context is">
+            <span class="metric">
+                <span class="metric-label">TTFT</span>
+                <span class="metric-value" id="metric-ttft">–</span>
+            </span>
+            <span class="metric-sep"></span>
+            <span class="metric">
+                <span class="metric-label">CTX</span>
+                <span class="metric-value" id="metric-ctx">–</span>
+            </span>
+            <span class="metric-bar-track">
+                <span class="metric-bar-fill" id="metric-ctx-bar" style="width:0%"></span>
+            </span>
         </div>
 
         <!-- Loading State -->
@@ -532,6 +621,36 @@
                     console.log('[LLM-RESPONSE] show-loading received');
                     showLoadingState();
                 });
+
+                // Track interaction mode. isInteractive used to stay false
+                // forever because nothing here listened for the change, so
+                // enableScrolling() never ran and wheel scrolling only worked
+                // by native overflow accident.
+                if (window.electronAPI.onInteractionModeChanged) {
+                    window.electronAPI.onInteractionModeChanged((event, interactive) => {
+                        const was = isInteractive;
+                        isInteractive = !!interactive;
+                        console.log('[LLM-RESPONSE] interaction mode:', isInteractive);
+                        if (isInteractive && !was && scrollableElements.length) {
+                            enableScrolling();
+                        } else if (!isInteractive && was) {
+                            disableScrolling();
+                        }
+                    });
+                }
+
+                // Poll latency/context gauges. Polling (not an event) because the
+                // metrics live in the main process and this window may be hidden
+                // between questions; a 1s timer is negligible.
+                const refreshMetrics = async () => {
+                    try {
+                        if (!window.electronAPI.getRequestMetrics) return;
+                        const m = await window.electronAPI.getRequestMetrics();
+                        updateMetricsBar(m);
+                    } catch (_) { /* gauges are cosmetic; never noisy */ }
+                };
+                refreshMetrics();
+                setInterval(refreshMetrics, 1000);
                 
                 // Listen for LLM response
                 window.electronAPI.onDisplayLlmResponse(function() {
@@ -578,17 +697,51 @@
         function showLoadingState() {
             const loadingElement = document.getElementById('loading');
             const responseElement = document.getElementById('response-content');
-            
+
             if (loadingElement) {
                 loadingElement.classList.remove('hidden');
                 loadingElement.style.display = ''; // Remove any forced display styles
             }
-            
+
             if (responseElement) {
                 responseElement.classList.add('hidden');
             }
-            
+
             console.log('Loading state shown - should see Analyzing...');
+        }
+
+        /**
+         * Render the TTFT / context gauges.
+         *
+         * Colour bands are judgement calls: green is what a live interview
+         * needs, amber is noticeable but usable, red means the candidate is
+         * waiting long enough to look away from the interviewer.
+         */
+        function updateMetricsBar(m) {
+            const ttftEl = document.getElementById('metric-ttft');
+            const ctxEl = document.getElementById('metric-ctx');
+            const barEl = document.getElementById('metric-ctx-bar');
+            if (!ttftEl || !ctxEl || !barEl || !m) return;
+
+            if (m.last && m.last.ttftMs != null) {
+                const ms = m.last.ttftMs;
+                ttftEl.textContent = ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
+                ttftEl.className = 'metric-value' + (ms > 5000 ? ' hot' : (ms > 2500 ? ' warn' : ''));
+            } else if (m.avgTtftMs != null) {
+                ttftEl.textContent = `${(m.avgTtftMs / 1000).toFixed(1)}s avg`;
+            } else {
+                ttftEl.textContent = '–';
+            }
+
+            const pct = m.last && m.last.contextPercent != null ? m.last.contextPercent : null;
+            if (pct != null) {
+                ctxEl.textContent = `${pct.toFixed(1)}%`;
+                barEl.style.width = `${Math.min(100, pct)}%`;
+                // Bar turns amber past half the practical window, red near full.
+                const fill = pct > 75 ? '#ff6b6b' : (pct > 50 ? '#ffb020' : '#4caf50');
+                barEl.style.background = fill;
+                ctxEl.className = 'metric-value' + (pct > 75 ? ' hot' : (pct > 50 ? ' warn' : ''));
+            }
         }
 
         function hideLoadingState() {

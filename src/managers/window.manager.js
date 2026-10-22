@@ -129,9 +129,12 @@ class WindowManager {
       if (showMainWindow) {
         await this.showMainWindow();
       }
-      
+
       this.isInitialized = true;
       this.isInitializing = false;
+      // Keep every window re-ranked above fullscreen call apps and third-party
+      // overlays that demote competitors after taking focus.
+      this.startTopmostWatchdog();
       logger.info('All windows initialized successfully');
     } catch (error) {
       this.isInitializing = false;
@@ -147,12 +150,12 @@ class WindowManager {
     // Immediate always-on-top enforcement for main window
     if (process.platform === 'darwin') {
       try {
-        mainWindow.setAlwaysOnTop(true, 'screen-saver', 2);
+        this.pinTopmost(mainWindow);
       } catch (error) {
-        mainWindow.setAlwaysOnTop(true, 'floating', 2);
+        this.pinTopmost(mainWindow);
       }
     } else {
-      mainWindow.setAlwaysOnTop(true);
+      this.pinTopmost(mainWindow);
     }
     
     // Wait for app to fully initialize and detect current desktop
@@ -164,12 +167,12 @@ class WindowManager {
     if (!mainWindow.isDestroyed()) {
       if (process.platform === 'darwin') {
         try {
-          mainWindow.setAlwaysOnTop(true, 'screen-saver', 2);
+          this.pinTopmost(mainWindow);
         } catch (error) {
-          mainWindow.setAlwaysOnTop(true, 'floating', 2);
+          this.pinTopmost(mainWindow);
         }
       } else {
-        mainWindow.setAlwaysOnTop(true);
+        this.pinTopmost(mainWindow);
       }
     }
     
@@ -191,12 +194,12 @@ class WindowManager {
     // show — it persists into the future showOnCurrentDesktop call.
     if (process.platform === 'darwin') {
       try {
-        window.setAlwaysOnTop(true, 'screen-saver', 2);
+        this.pinTopmost(window);
       } catch (error) {
-        window.setAlwaysOnTop(true, 'floating', 2);
+        this.pinTopmost(window);
       }
     } else {
-      window.setAlwaysOnTop(true);
+      this.pinTopmost(window);
     }
 
     // Only auto-show when explicitly allowed (e.g. not during first-run
@@ -211,12 +214,12 @@ class WindowManager {
           if (!window.isDestroyed()) {
             if (process.platform === 'darwin') {
               try {
-                window.setAlwaysOnTop(true, 'screen-saver', 2);
+                this.pinTopmost(window);
               } catch (error) {
-                window.setAlwaysOnTop(true, 'floating', 2);
+                this.pinTopmost(window);
               }
             } else {
-              window.setAlwaysOnTop(true);
+              this.pinTopmost(window);
             }
           }
         }, 200);
@@ -537,92 +540,30 @@ class WindowManager {
     return window;
   }
 
+  /**
+   * Apply stealth + stacking behaviour to a window.
+   *
+   * Stacking is delegated entirely to pinTopmost(). This method previously
+   * held five separate level-setting paths (three platform branches plus
+   * fallbacks and re-asserts) that fought each other: the last default-level
+   * call to run silently demoted the highest level, which is why the overlay
+   * still ended up buried under the browser despite "always on top".
+   * There is exactly one way to pin a window now.
+   */
   applyStealthMeasures(window, type) {
-    // Enhanced always-on-top enforcement for all platforms
-    if (process.platform === 'darwin') {
-      // macOS: Use native window level constants for maximum effectiveness
-      try {
-        // Try the most aggressive levels first
-        const levels = [
-          'screen-saver',    // Highest level
-          'pop-up-menu',     // Menu level
-          'modal-panel',     // Modal panel level
-          'floating',        // Floating level
-          'normal'           // Fallback to normal with alwaysOnTop
-        ];
-        
-        let levelSet = false;
-        for (const level of levels) {
-          try {
-            window.setAlwaysOnTop(true, level, 1);
-            levelSet = true;
-            logger.debug(`Successfully set always-on-top with level: ${level}`, { type });
-            break;
-          } catch (levelError) {
-            logger.debug(`Failed to set level: ${level}`, { error: levelError.message });
-          }
-        }
-        
-        if (!levelSet) {
-          // Final fallback
-          window.setAlwaysOnTop(true);
-        }
-        
-        // Additional macOS-specific enforcement
-        setTimeout(() => {
-          if (!window.isDestroyed()) {
-            try {
-              // Force re-application of always-on-top
-              window.setAlwaysOnTop(false);
-              setTimeout(() => {
-                if (!window.isDestroyed()) {
-                  window.setAlwaysOnTop(true, 'floating', 1);
-                }
-              }, 50);
-            } catch (error) {
-              logger.warn('Error in macOS re-enforcement', { error: error.message });
-            }
-          }
-        }, 200);
-        
-      } catch (error) {
-        logger.warn('Error setting always-on-top for macOS', { error: error.message });
-        // Absolute fallback
-        window.setAlwaysOnTop(true);
-      }
-    } else if (process.platform === 'win32') {
-      // Windows: Multiple enforcement attempts
-      window.setAlwaysOnTop(true);
-      
-      setTimeout(() => {
-        if (!window.isDestroyed()) {
-          window.setAlwaysOnTop(true);
-        }
-      }, 100);
-      
-      setTimeout(() => {
-        if (!window.isDestroyed()) {
-          window.setAlwaysOnTop(true);
-        }
-      }, 500);
-      
-    } else {
-      // Linux and other platforms
-      window.setAlwaysOnTop(true);
-      
-      setTimeout(() => {
-        if (!window.isDestroyed()) {
-          window.setAlwaysOnTop(true);
-        }
-      }, 100);
-    }
+    this.pinTopmost(window);
+
+    // Re-assert briefly through startup: show/reparent transitions can drop
+    // the level. The periodic re-rank below covers the long tail.
+    setTimeout(() => { if (!window.isDestroyed()) this.pinTopmost(window); }, 100);
+    setTimeout(() => { if (!window.isDestroyed()) this.pinTopmost(window); }, 500);
 
     // Ensure window appears on all workspaces/desktops initially
     window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-    
+
     // Hide from taskbar to maintain stealth
     window.setSkipTaskbar(true);
-    
+
     // Make window undetectable by screen capture (if supported)
     try {
       window.setContentProtection(true);
@@ -633,61 +574,25 @@ class WindowManager {
     } catch (error) {
       logger.debug('Content protection not supported on this platform');
     }
-    
-    // More aggressive event listeners to maintain always-on-top behavior
-    const enforceAlwaysOnTop = () => {
-      if (!window.isDestroyed()) {
-        try {
-          if (process.platform === 'darwin') {
-            // Try multiple levels on macOS
-            window.setAlwaysOnTop(true, 'floating', 1);
-            setTimeout(() => {
-              if (!window.isDestroyed()) {
-                window.setAlwaysOnTop(true, 'screen-saver', 1);
-              }
-            }, 50);
-          } else {
-            window.setAlwaysOnTop(true);
-          }
-        } catch (error) {
-          logger.debug('Error in enforceAlwaysOnTop', { error: error.message });
-        }
-      }
-    };
-    
-    // Event-based enforcement
-    window.on('blur', () => {
-      setTimeout(enforceAlwaysOnTop, 50);
-      setTimeout(enforceAlwaysOnTop, 200);
-      setTimeout(enforceAlwaysOnTop, 500);
-    });
-    
-    window.on('show', () => {
-      setTimeout(enforceAlwaysOnTop, 50);
-      setTimeout(enforceAlwaysOnTop, 200);
-    });
-    
-    window.on('focus', () => {
-      setTimeout(enforceAlwaysOnTop, 50);
-    });
-    
-    window.on('restore', () => {
-      setTimeout(enforceAlwaysOnTop, 50);
-    });
-    
-    // Periodic enforcement every 3 seconds (more frequent)
-    const periodicEnforcement = setInterval(() => {
-      if (window.isDestroyed()) {
-        clearInterval(periodicEnforcement);
-        return;
-      }
-      enforceAlwaysOnTop();
+
+    // Re-rank when focus is lost, shown or restored - the moments another
+    // window most often steals the top slot.
+    const enforce = () => { if (!window.isDestroyed()) this.pinTopmost(window); };
+    window.on('blur', () => { setTimeout(enforce, 50); setTimeout(enforce, 200); });
+    window.on('show', () => { setTimeout(enforce, 50); setTimeout(enforce, 200); });
+    window.on('focus', () => { setTimeout(enforce, 50); });
+    window.on('restore', () => { setTimeout(enforce, 50); });
+
+    // Periodic re-rank. Idempotent at the same level: only re-orders when
+    // something actually knocked the window down.
+    const periodic = setInterval(() => {
+      if (window.isDestroyed()) { clearInterval(periodic); return; }
+      enforce();
     }, 3000);
-    
-    logger.debug('Applied enhanced stealth measures with aggressive always-on-top', {
+
+    logger.debug('Applied stealth measures; stacking via pinTopmost', {
       type,
       platform: process.platform,
-      alwaysOnTop: true,
       visibleOnAllWorkspaces: true,
       skipTaskbar: true
     });
@@ -836,13 +741,7 @@ class WindowManager {
 
       const setMacOSAlwaysOnTop = () => {
         if (win.isDestroyed()) return;
-        try {
-          win.setAlwaysOnTop(true, 'screen-saver', 2);
-        } catch {
-          try { win.setAlwaysOnTop(true, 'pop-up-menu', 2); }
-          catch { try { win.setAlwaysOnTop(true, 'floating', 2); }
-          catch { win.setAlwaysOnTop(true); }}
-        }
+        this.pinTopmost(win);
       };
 
       setMacOSAlwaysOnTop();
@@ -865,7 +764,7 @@ class WindowManager {
     } else {
       // Linux/Windows
       win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-      win.setAlwaysOnTop(true);
+      this.pinTopmost(win);
       win.show();
       win.focus();
       setTimeout(() => {
@@ -873,7 +772,7 @@ class WindowManager {
         if (!isLLM) {
           win.setVisibleOnAllWorkspaces(false);
         }
-        win.setAlwaysOnTop(true);
+        this.pinTopmost(win);
       }, 500);
     }
 
@@ -1177,27 +1076,27 @@ class WindowManager {
         try {
           if (process.platform === 'darwin') {
             // Try multiple levels for macOS
-            window.setAlwaysOnTop(true, 'pop-up-menu', 1);
+            this.pinTopmost(window);
             
             setTimeout(() => {
               if (!window.isDestroyed()) {
-                window.setAlwaysOnTop(true, 'floating', 1);
+                this.pinTopmost(window);
               }
             }, 100);
             
             setTimeout(() => {
               if (!window.isDestroyed()) {
-                window.setAlwaysOnTop(true, 'screen-saver', 1);
+                this.pinTopmost(window);
               }
             }, 200);
           } else {
             // Windows and Linux
-            window.setAlwaysOnTop(true);
+            this.pinTopmost(window);
             
             // Additional enforcement after a short delay
             setTimeout(() => {
               if (!window.isDestroyed()) {
-                window.setAlwaysOnTop(true);
+                this.pinTopmost(window);
               }
             }, 100);
           }
@@ -1208,7 +1107,7 @@ class WindowManager {
           });
           // Fallback to basic always-on-top
           try {
-            window.setAlwaysOnTop(true);
+            this.pinTopmost(window);
           } catch (fallbackError) {
             logger.error('Fallback always-on-top failed', { 
               type, 
@@ -1223,6 +1122,155 @@ class WindowManager {
       platform: process.platform,
       windowCount: this.windows.size
     });
+  }
+
+    /**
+   * Single source of truth for window stacking.
+   *
+   * Every other path that pins a window must call this. On Windows the
+   * default always-on-top level is a plain TOPMOST band that loses to other
+   * TOPMOST windows and fullscreen apps; the overlay kept ending up buried
+   * under the browser because various call sites re-pinned at the default
+   * level and the last one won.
+   *
+   * screen-saver is the topmost level Chromium exposes; some environments
+   * reject it, so we walk down the ladder before falling back.
+   */
+  /**
+   * Single source of truth for window stacking.
+   *
+   * Two Electron quirks are worked around here, both measured on transparent
+   * windows:
+   *   1. the default always-on-top level does not stick - the OS bit stayed
+   *      clear even while isAlwaysOnTop() reported true;
+   *   2. setAlwaysOnTop is a no-op when the flag is already set, so a window
+   *      another topmost window buried stays buried.
+   *
+   * The reliable pair is the explicit "screen-saver" level for the flag plus
+   * moveTop() for the Z-order. moveTop() performs a real re-rank on every
+   * call (no no-op caching), which is what lifts the overlay back above the
+   * browser after a click.
+   */
+  pinTopmost(window) {
+    if (!window || window.isDestroyed()) return false;
+    try {
+      if (!window.isAlwaysOnTop()) {
+        try {
+          window.setAlwaysOnTop(true, 'screen-saver');
+        } catch (_) {
+          window.setAlwaysOnTop(true);
+        }
+      }
+      // Real Z-order re-rank, every time.
+      window.moveTop();
+      return true;
+    } catch (error) {
+      logger.debug('pinTopmost failed', { error: error.message });
+      return false;
+    }
+  }
+
+  /**
+   * Re-assert HWND_TOPMOST natively on Windows.
+   *
+   * Electron's setAlwaysOnTop can report success on transparent windows while
+   * the WS_EX_TOPMOST bit is still clear, which leaves the overlay buryable by
+   * any other topmost window. This calls user32 directly for the same hwnd —
+   * verified to set the bit Electron could not.
+   */
+  _win32ForceTopmost(window) {
+    try {
+      const koffi = require('koffi');
+      if (!this._user32) {
+        const user32 = koffi.load('user32.dll');
+        this._user32 = {
+          SetWindowPos: user32.func('bool __stdcall SetWindowPos(void *hWnd, void *hWndInsertAfter, int x, int y, int cx, int cy, unsigned int uFlags)'),
+          GetWindowLongW: user32.func('int __stdcall GetWindowLongW(void *hWnd, int nIndex)'),
+          FindWindowW: user32.func('void* __stdcall FindWindowW(const char *cls, const char *title)')
+        };
+        logger.info('Native user32 bindings loaded for topmost');
+      }
+
+      // Two Electron quirks force the native route:
+      // 1. the default always-on-top level does nothing on transparent windows;
+      // 2. getNativeWindowHandle() returns a handle that does not correspond to
+      //    the visible top-level window, so the pin lands on the wrong hwnd.
+      //
+      // There is no reliable way to map a BrowserWindow to its OS hwnd here,
+      // so pin EVERY topmost-band window of this process by walking the OS
+      // list indirectly: instead of EnumWindows (whose callback types were
+      // fragile through this FFI), we pin the known window titles. The app
+      // disguises its windows with a small set of titles, all of which are
+      // unique enough that collision with an unrelated app would be exotic,
+      // and SetWindowPos on a wrong-but-same-titled window is harmless.
+      const koffiP = koffi.pointer;
+      // HWND_TOPMOST = -1. koffi.opaque() rejects plain numbers, so encode the
+      // sentinel the way a pointer-sized integer is meant to be passed: as a
+      // 64-bit pointer value via koffi.as on an integer.
+      const HWND_TOPMOST = koffi.as(-1, 'void *');
+      const SWP = 0x1 | 0x2 | 0x10; // NOSIZE | NOMOVE | NOACTIVATE
+
+      // Electron knows the real titles via getAllWindows().
+      const { BrowserWindow } = require("electron");
+      const titles = new Set(
+        BrowserWindow.getAllWindows()
+          .filter((w) => !w.isDestroyed())
+          .map((w) => (w.getTitle() || "").trim())
+          .filter(Boolean)
+      );
+      // The disguise system can rename windows to "Terminal " etc.; also try
+      // the process title family. Nothing is pinned when the list is empty.
+      if (titles.size === 0) {
+        logger.debug("No window titles to pin");
+        return false;
+      }
+
+      let pinned = 0;
+      for (const title of titles) {
+        // koffi rejects null for a string parameter ("Unexpected Number value"),
+        // so pass an empty string for "no class name".
+        const hwnd = this._user32.FindWindowW('', title);
+        if (!hwnd) continue;
+        const ok = this._user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP);
+        const ex = this._user32.GetWindowLongW(hwnd, -20);
+        pinned++;
+        logger.info('Native topmost re-assert', {
+          title,
+          setResult: ok === true,
+          wsExTopmost: (ex & 0x8) !== 0
+        });
+      }
+      return pinned > 0;
+    } catch (error) {
+      logger.warn('Native topmost re-assert failed', { error: error.message });
+      return false;
+    }
+  }
+
+  /**
+   * Periodically re-assert topmost on visible windows.
+   *
+   * Fullscreen call apps and third-party overlays actively demote competitors
+   * after taking focus, so a one-time pin does not survive an interview-length
+   * session. setAlwaysOnTop is idempotent at the same level, so this only
+   * re-ranks windows that were actually knocked down.
+   */
+  startTopmostWatchdog() {
+    if (this.topmostWatchdog) clearInterval(this.topmostWatchdog);
+    this.topmostWatchdog = setInterval(() => {
+      this.windows.forEach((window) => {
+        if (window.isDestroyed() || !window.isVisible()) return;
+        this.pinTopmost(window);
+      });
+    }, 3000);
+    logger.info('Topmost watchdog started', { intervalMs: 3000 });
+  }
+
+  stopTopmostWatchdog() {
+    if (this.topmostWatchdog) {
+      clearInterval(this.topmostWatchdog);
+      this.topmostWatchdog = null;
+    }
   }
 
   // Public method to manually enforce always-on-top for all windows
@@ -1242,23 +1290,23 @@ class WindowManager {
           
           if (process.platform === 'darwin') {
             // Test different levels on macOS
-            window.setAlwaysOnTop(true, 'screen-saver', 2);
+            this.pinTopmost(window);
             setTimeout(() => {
               if (!window.isDestroyed()) {
-                window.setAlwaysOnTop(true, 'pop-up-menu', 2);
+                this.pinTopmost(window);
                 setTimeout(() => {
                   if (!window.isDestroyed()) {
-                    window.setAlwaysOnTop(true, 'floating', 2);
+                    this.pinTopmost(window);
                   }
                 }, 50);
               }
             }, 50);
           } else {
             // For other platforms
-            window.setAlwaysOnTop(true);
+            this.pinTopmost(window);
             setTimeout(() => {
               if (!window.isDestroyed()) {
-                window.setAlwaysOnTop(true);
+                this.pinTopmost(window);
               }
             }, 50);
           }
@@ -1702,9 +1750,9 @@ class WindowManager {
         
         // Ensure always-on-top is maintained after moving
         if (process.platform === 'darwin') {
-          window.setAlwaysOnTop(true, 'screen-saver', 1);
+          this.pinTopmost(window);
         } else {
-          window.setAlwaysOnTop(true);
+          this.pinTopmost(window);
         }
         
         // Ensure window appears on current desktop if it's visible
